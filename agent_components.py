@@ -1,4 +1,4 @@
-from xai_components.base import InArg, OutArg, InCompArg, Component, BaseComponent, xai_component, dynalist
+from xai_components.base import InArg, OutArg, InCompArg, Component, BaseComponent, xai_component, dynalist, secret
 
 import abc
 from collections import deque
@@ -109,6 +109,12 @@ class NumpyMemoryImpl(Memory):
 
 @xai_component
 class AgentNumpyMemory(Component):
+    """Creates a local and temporary memory for the agent to store and query information.
+
+    ##### outPorts:
+    - memory: The Memory to set on AgentInit
+    """
+     
     memory: OutArg[Memory]
 
     def execute(self, ctx) -> None:
@@ -134,46 +140,25 @@ class MutableVariable:
     @property
     def value(self) -> any:
         return self._fn()
-    
-
-@xai_component
-class AgentMakeTool(Component):
-    run_tool: BaseComponent
-    
-    name: InCompArg[str]
-    description: InCompArg[str]
-    output_ref: InCompArg[str]
-    
-    tool_ref: OutArg[Tool]
-    input_ref: OutArg[str]
-    
-    def execute(self, ctx) -> None:
-        other_self = self
-        
-        class CustomTool(Tool):
-            name = other_self.name.value
-            description = other_self.description.value
-            inputs = ["text"]
-            output = ["text"]
-            
-            def __call__(self, prompt):
-                other_self.input_ref.value = prompt
-                next = other_self.run_tool
-                while next:
-                    next = next.do(ctx)
-                return other_self.output_ref.value
-            
-        self.tool_ref.value = CustomTool(
-            self.name.value,
-            self.description.value,
-            ["text"],
-            ["text"]
-        )
-
 
 
 @xai_component(type="Start", color="red")
 class AgentDefineTool(Component):    
+    """Define a tool that the agent can use when it deems necessary.
+
+    This event will be called when the Agent uses this tool.  Perform the tool
+    actions and set the output with AgentToolOutput
+
+    ##### inPorts:
+    - tool_name: The name of the tool.
+    - description: The description of the tool.
+    - for_toolbelt: The toolbelt to add the tool to.  If not set, will be added to the default toolbelt.
+
+    ##### outPorts:
+    - tool_input: The input for the tool coming from the agent.
+
+    """
+
     tool_name: InCompArg[str]
     description: InCompArg[str]
     for_toolbelt: InArg[str]
@@ -213,7 +198,14 @@ class AgentDefineTool(Component):
         )
 
 @xai_component(color="red")
-class AgentToolOutput(Component):    
+class AgentToolOutput(Component):
+    """Output the result of the tool to the agent.
+
+    ##### inPorts:
+    - results: The results of the tool to be returned to the agent.
+
+    """
+
     results: InArg[dynalist]
     
     def execute(self, ctx) -> None:
@@ -224,6 +216,15 @@ class AgentToolOutput(Component):
 
 @xai_component
 class AgentMakeToolbelt(Component):
+    """Create a toolbelt for the agent to use.
+
+    ##### inPorts:
+    - name: The name of the toolbelt.
+
+    ##### outPorts:
+    - toolbelt_spec: The toolbelt to set on AgentInit
+
+    """
     name: InArg[str]
     toolbelt_spec: OutArg[dict]
 
@@ -242,32 +243,23 @@ class AgentMakeToolbelt(Component):
 
 
 @xai_component
-class AgentToolbelt(Component):
-    tool1: InArg[Tool]
-    tool2: InArg[Tool]
-    tool3: InArg[Tool]
-    tool4: InArg[Tool]
-    tool5: InArg[Tool]
-    tool6: InArg[Tool]
-    tool7: InArg[Tool]
-
-    toolbelt_spec: OutArg[dict]
-
-    def execute(self, ctx) -> None:
-        spec = {}
-        
-        for tool in [self.tool1.value, self.tool2.value, self.tool3.value, self.tool4.value, self.tool5.value, self.tool6.value, self.tool7.value]:
-            if tool is not None:
-                spec[tool.name] = tool
-            
-        self.toolbelt_spec.value = spec
-
-
-@xai_component
 class AgentVectoMemory(Component):
-    api_key: InArg[str]
+    """Creates a memory for the agent to store and query information.
+    
+    ##### inPorts:
+    - api_key: The API key for Vecto.
+    - vector_space: The name of the vector space to use.
+    - initialize: Whether to initialize the vector space.
+
+    ##### outPorts:
+    - memory: The Memory to set on AgentInit
+
+    """
+
+    api_key: InArg[secret]
     vector_space: InCompArg[str]
     initialize: InCompArg[bool]
+
     memory: OutArg[Memory]
 
     def execute(self, ctx) -> None:
@@ -304,6 +296,19 @@ class AgentVectoMemory(Component):
 
 @xai_component
 class AgentInit(Component):
+    """Initialize the agent with the necessary components.
+
+    ##### inPorts:
+    - agent_name: The name of the agent to create.
+    - agent_provider: The provider of the agent (Either openai or vertexai).
+    - agent_model: The model that the agent should use (Such as gpt-3.5-turbo, or gemini-pro).
+    - agent_memory: The memory that the agent should use to store data it wants to remember.
+    - system_prompt: The system prompt of the agent be sure to speficy 
+      {tool_instruction} and {tools} to explain how to use them.
+    - max_thoughts: The maximum number of thoughts/tools the agent can use before it must respond to the user.
+    - toolbelt_spec: The toolbelt the agent has access to.
+    """
+
     agent_name: InCompArg[str]
     agent_provider: InCompArg[str]
     agent_model: InCompArg[str]
@@ -354,6 +359,20 @@ def conversation_to_vertexai(conversation) -> str:
  
 @xai_component
 class AgentRun(Component):
+    """Run the agent with the given conversation.
+    
+    ##### branches:
+    - on_thought: Called whenever the agent uses a tool.
+
+    ##### inPorts:
+    - agent_name: The name of the agent to run.
+    - conversation: The conversation to send to the agent.
+
+    ##### outPorts:
+    - out_conversation: The conversation with the agent's responses.
+    - last_response: The last response of the agent.
+
+    """
     on_thought: BaseComponent
     
     agent_name: InCompArg[str]
@@ -384,14 +403,8 @@ class AgentRun(Component):
             while thoughts < agent['max_thoughts']:
                 thoughts += 1
                 
-                parameters = {
-                    "max_output_tokens": 2048,
-                    "temperature": 0.9,
-                    "top_p": 1
-                }
+
                 inputs = conversation_to_vertexai(conversation)
-                print("sending to vertexai")
-                print(inputs)
 
                 model = GenerativeModel("gemini-pro")
                 result = model.generate_content(
@@ -412,11 +425,6 @@ class AgentRun(Component):
                     response = {"role": "assistant", "content": result.text.split("assistant:")[-1]}
                 else:
                     response = {"role": "assistant", "content": result.text}
-
-                
-                print("got results")
-                print(result.text)
-                
                 
                 conversation.append(response)                
                 
@@ -563,6 +571,21 @@ def word_or_pair_generator(input_string):
 
 @xai_component
 class AgentStreamStringResponse(Component):
+    """Creates a Stream response from a string.
+
+    When using Converse it is better for the user to see the response word by word
+    as if it was being typed out, like it is in ChatGPT.
+
+    Use with the ConverseStreamRespond or ConverseStreamPartialResponse 
+    component when using Converse.
+
+    ##### inPorts:
+    - input_str: The string to stream.
+
+    ##### outPorts:
+    - result_stream: The result of the string to stream.
+    """
+    
     input_str: InCompArg[str]
     
     result_stream: OutArg[any]
