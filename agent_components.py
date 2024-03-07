@@ -108,7 +108,7 @@ class NumpyMemoryImpl(Memory):
 
 
 @xai_component
-class NumpyMemory(Component):
+class AgentNumpyMemory(Component):
     memory: OutArg[Memory]
 
     def execute(self, ctx) -> None:
