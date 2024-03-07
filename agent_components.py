@@ -318,7 +318,7 @@ class AgentInit(Component):
     toolbelt_spec: InCompArg[dict]
     
     def execute(self, ctx) -> None:
-        if self.agent_provider.value != 'openai':
+        if self.agent_provider.value != 'openai' and self.agent_provider.value != 'vertexai':
             raise Exception(f"agent provider: {self.agent_provider.value} is not supported in this version of xai_agent.")
 
         ctx['agent_' + self.agent_name.value] = {
@@ -402,19 +402,24 @@ class AgentRun(Component):
             
             while thoughts < agent['max_thoughts']:
                 thoughts += 1
+
+                if thoughts == agent['max_thoughts']:
+                    conversation.append({"role": "system", "content": "Maximum tool usage reached.  Tools Unavailable"})
                 
 
                 inputs = conversation_to_vertexai(conversation)
 
-                model = GenerativeModel("gemini-pro")
+                model = GenerativeModel(model_name)
                 result = model.generate_content(
                     inputs,
                     generation_config={
                         "max_output_tokens": 2048,
                         "stop_sequences": [
-                            "user:"
+                            "\n\nsystem:",
+                            "\n\nuser:",
+                            "\n\nassistant:"
                         ],
-                        "temperature": stress_level,
+                        "temperature": stress_level + 0.5,
                         "top_p": 1
                     },
                     safety_settings=[],
@@ -428,27 +433,65 @@ class AgentRun(Component):
                 
                 conversation.append(response)                
                 
-                if 'TOOL:' in response['content']:
+                if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
+
+                    next_action = self.on_thought
+                    while next_action:
+                        next_action = next_action.do(ctx)
+                    
                     lines = response['content'].split("\n")
                     for line in lines:
-                        if "TOOL:" in line:
+                        if line.startswith("TOOL:"):
                             command = line.split(":", 1)[1].strip()
-                            tool_name = command.split(" ", 1)[0].strip()
-                            tool_args = command.split(" ", 1)[1]
-                            
                             try:
-                                tool_result = toolbelt[tool_name](tool_args)
-                                print(f"tool {tool_name} got result:")
-                                print(tool_result)
-                                
-                                conversation.append({"role": "system", "content": tool_result})
+                                tool_name = command.split(" ", 1)[0].strip()
+                                tool_args = command.split(" ", 1)[1].strip()
                             except Exception as e:
-                                print(f"tool {tool_name} got exception:")
-                                print(e)
-                                conversation.append({"role": "system", "content": "ERROR: " + str(e)})
-                                stress_level = min(stress_level + 0.1, 1.5)
+                                tool_name = command.strip()
+                                tool_args = ""
+
+                            if tool_name == 'recall':
+                                memory = agent['agent_memory']
+                                tool_result = str(memory.query(tool_args, 3))
+                                print(f"recall got result: {tool_result}", flush=True)
+                                conversation.append({"role": "system", "content": tool_result})
+                            elif tool_name == 'remember':
+                                #'TOOL: remember “prompt goes here” “{\”json\”: \”arbitrary\”}”
+                                memory = agent['agent_memory']
+                                prompt_start = tool_args.find('"')
+                                prompt_end = tool_args.find('"', prompt_start)
+                                prompt = tool_args[prompt_start + 1:prompt_end].strip()
+                                memo_start = tool_args.find('"', prompt_end)
+                                memo = tool_args[memo_start + 1:len(tool_args - 1)].replace('\"', '"')
+
+                                try:
+                                    json_memo = json.loads(memo)
+                                except Exception as e:
+                                    # Invalid JSON, so just store as a string.
+                                    json_memo = '"' + memo + '"'
+                                    
+                                memory.add('', prompt, json_memo)
+                                print(f"Added {prompt}: {memo} to memory", flush=True)
+                                conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+                                
+                            else:
+                                try:
+                                    tool_result = toolbelt[tool_name](tool_args)
+                                    print(f"tool {tool_name} got result:")
+                                    print(tool_result)
+                                    
+                                    conversation.append({"role": "system", "content": tool_result})
+                                except KeyError as e:
+                                    print(f"tool {tool_name} not found.")
+                                    conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
+                                    stress_level = min(stress_level + 0.1, 1.5)
+                                except Exception as e:
+                                    print(f"tool {tool_name} got exception:")
+                                    print(e)
+                                    conversation.append({"role": "system", "content": "ERROR: " + str(e)})
+                                    stress_level = min(stress_level + 0.1, 1.5)
                 else:
-                    print("No tool in response thoughts finished.")
+                    # Allow only one tool per thought.
                     break
             self.out_conversation.value = conversation
             self.last_response.value = conversation[-1]['content']
