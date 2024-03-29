@@ -188,7 +188,7 @@ class AgentDefineTool(Component):
                     next = next.do(ctx)
                 result = ctx['tool_output']
                 ctx['tool_output'] = None
-                return result.value
+                return result
             
         self.tool_ref.value = CustomTool(
             self.tool_name.value,
