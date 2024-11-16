@@ -8,7 +8,14 @@ readme = "README.md"
 repository = "https://github.com/XpressAI/xai-agent"
 keywords = ["xircuits", "agent", "openai", "vertexai"]
 
+dependencies = [
+    "requests",
+    "vecto-sdk",
+    "numpy",
+    "openai==1.52.0"
+]
+
 # Xircuits-specific configurations
 [tool.xircuits]
-default_example_path = "examples/agent_example.xircuits"
+default_example_path = "agent_example.xircuits"
 requirements_path = "requirements.txt"
