@@ -356,7 +356,7 @@ def conversation_to_vertexai(conversation) -> str:
         ret += "\n\n"
     
     return ret
- 
+
 @xai_component
 class AgentRun(Component):
     """Run the agent with the given conversation.
@@ -456,7 +456,7 @@ class AgentRun(Component):
                                 print(f"recall got result: {tool_result}", flush=True)
                                 conversation.append({"role": "system", "content": tool_result})
                             elif tool_name == 'remember':
-                                #'TOOL: remember “prompt goes here” “{\”json\”: \”arbitrary\”}”
+
                                 memory = agent['agent_memory']
                                 prompt_start = tool_args.find('"')
                                 prompt_end = tool_args.find('"', prompt_start)
@@ -556,7 +556,6 @@ class AgentRun(Component):
                                 print(f"recall got result: {tool_result}", flush=True)
                                 conversation.append({"role": "system", "content": tool_result})
                             elif tool_name == 'remember':
-                                #'TOOL: remember “prompt goes here” “{\”json\”: \”arbitrary\”}”
                                 memory = agent['agent_memory']
                                 prompt_start = tool_args.find('"')
                                 prompt_end = tool_args.find('"', prompt_start)
