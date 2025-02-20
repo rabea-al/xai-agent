@@ -1,5 +1,5 @@
-from xai_components.base import InArg, OutArg, InCompArg, Component, BaseComponent, xai_component, dynalist, secret
-
+from xai_components.base import InArg, OutArg, InCompArg, Component, BaseComponent, xai_component, dynalist, secret, SubGraphExecutor
+import traceback
 import abc
 from collections import deque
 from typing import NamedTuple
@@ -33,6 +33,57 @@ except Exception as e:
 def random_string(length):
     return ''.join(random.choice(string.ascii_letters) for _ in range(length))
 
+def encode_prompt(model_id: str, conversation: list):
+    ret_messages = []
+
+    if model_id.startswith('anthropic.claude-3'):
+        for message in conversation:
+            if message['role'] == 'system':
+                message['role'] = 'user'
+            
+            if isinstance(message['content'], str):
+                ret_messages.append({
+                    'role': message['role'],
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': message['content']
+                        }
+                    ]
+                })
+            else:
+                new_contents = []
+                for content in message['content']:
+                    if content['type'] == 'image_url':
+                        # f"data:image/jpeg;base64,{base64_image}"
+                        url = content['image_url']['url']
+                        (media_type, rest) = url.split(';', 1)
+                        data = rest.split(',', 1)
+                        media_type = media_type.split(':', 1)[1]
+        
+                        source = {
+                            'type': 'base64',
+                            'media_type': media_type,
+                            'data': data[1]
+                        }
+    
+                        new_contents.append({
+                            'type': 'image',
+                            'source': source
+                        })
+                    else:
+                        new_contents.append({
+                            'type': 'text',
+                            'text': content['text']
+                        })
+
+                ret_messages.append({
+                    'role': message['role'],
+                    'content': new_contents
+                })
+                
+    return ret_messages
+
 
 class Memory(abc.ABC):
     def query(self, query: str, n: int) -> list:
@@ -49,9 +100,7 @@ class VectoMemoryImpl(Memory):
     def query(self, query: str, n: int) -> list:
         return self.vs.lookup(query, 'TEXT', n)
     def add(self, id: str, text: str, metadata: dict) -> None:
-        from vecto import vecto_toolbelt
-
-        vecto_toolbelt.ingest_text(self.vs, [text], [metadata])
+        self.vs.ingest_text(text, metadata)
 
 
 
@@ -279,8 +328,15 @@ class AgentVectoMemory(Component):
                 self.memory.value = VectoMemoryImpl(vs)
                 break
         if not self.memory.value:
-            raise Exception(f"Could not find vector space with name {self.vector_space.value}")
-
+            vs = Vecto(api_key)
+            model_id = [model for model in vs.list_models() if model.name == 'QWEN2'][0].id
+            res = requests.post("https://api.vecto.ai/api/v0/account/space", headers=headers, json={
+                "name": self.vector_space.value,
+                "modelId": model_id
+            })
+            data = res.json()
+            vs = Vecto(api_key, data['id'])
+            self.memory.value = VectoMemoryImpl(vs)
 
 # TBD
 #@xai_component
@@ -300,8 +356,8 @@ class AgentInit(Component):
 
     ##### inPorts:
     - agent_name: The name of the agent to create.
-    - agent_provider: The provider of the agent (Either openai or vertexai).
-    - agent_model: The model that the agent should use (Such as gpt-3.5-turbo, or gemini-pro).
+    - agent_provider: The provider of the agent (Either openai, vertexai, or bedrock).
+    - agent_model: The model that the agent should use (Such as gpt-3.5-turbo, gemini-pro, or anthropic.claude-3-5-sonnet-20240620-v1:0).
     - agent_memory: The memory that the agent should use to store data it wants to remember.
     - system_prompt: The system prompt of the agent be sure to speficy 
       {tool_instruction} and {tools} to explain how to use them.
@@ -318,7 +374,7 @@ class AgentInit(Component):
     toolbelt_spec: InCompArg[dict]
     
     def execute(self, ctx) -> None:
-        if self.agent_provider.value != 'openai' and self.agent_provider.value != 'vertexai':
+        if self.agent_provider.value != 'openai' and self.agent_provider.value != 'vertexai' and self.agent_provider.value != 'bedrock':
             raise Exception(f"agent provider: {self.agent_provider.value} is not supported in this version of xai_agent.")
 
         ctx['agent_' + self.agent_name.value] = {
@@ -335,15 +391,15 @@ def make_tools_prompt(toolbelt: dict) -> dict:
     ret = ''
     
     for key, value in toolbelt.items():
-        ret += f'{key}: {value.description} (Inputs: {value.inputs}) (Outputs: {value.outputs})\n'
+        ret += f'{key}: {value.description}\n'
 
-    recall = 'recall: Fuzzily looks up a previously remembered JSON memo in your memory. (Inputs: ["text"]) (Outputs: ["text"])\n'
-    remember = 'remember: Remembers a prompt, and a json note pair for the future. (Inputs: ["text", "text"]) (Outputs: ["text"]) (Example: TOOL: remember "todo later" "{ \"tasks\": [\"buy milk\",\"take out the trash\"]}"\n'
+    recall = 'lookup_memory: Fuzzily looks up a previously remembered JSON memo in your memory.\nEXAMPLE:\n\nUSER:\nWhat things did I have to do today?\nASSISTANT:\nTOOL: lookup_memory {"query":"todo list"}\nSYSTEM:\n[{"id": 1, "summary": Todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}]\nASSISTANT:\nTOOL: get_current_time\nSYSTEM:\n2024-02-01T09:30:03\nASSISTANT:\nLooks like you just had to send invoices today.\n'
+    remember = 'create_memory: Remembers a new json note for the future.  Always provide json with a summary prompt that will serve as the lookup vector.  The summary and entire json can be remembered later with lookup_memory.\nEXAMPLE:\n\nUSER:\nRemind me to send invoices on the first of Feburary.\nASSISTANT:\nTOOL: update_memory { "summary": "todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}"\n'
     
     return { 
         'tools': ret,
-        'recall': recall,
-        'remember': remember,
+        'lookup_memory': recall,
+        'create_memory': remember,
         'memory': recall + remember,
         'tool_instruction': 'To use a tool write TOOL: in one line followed by the tool name and arguments, system will respond with the results.'
     }
@@ -356,11 +412,11 @@ def conversation_to_vertexai(conversation) -> str:
         ret += "\n\n"
     
     return ret
-
+ 
 @xai_component
 class AgentRun(Component):
     """Run the agent with the given conversation.
-    
+
     ##### branches:
     - on_thought: Called whenever the agent uses a tool.
 
@@ -374,228 +430,591 @@ class AgentRun(Component):
 
     """
     on_thought: BaseComponent
-    
+
     agent_name: InCompArg[str]
     conversation: InCompArg[any]
-    
+
     out_conversation: OutArg[list]
     last_response: OutArg[str]
-    
+
     def execute(self, ctx) -> None:
         agent = ctx['agent_' + self.agent_name.value]
 
-        if agent['agent_provider'] == 'vertexai':
-            model_name = agent['agent_model']
-            toolbelt = agent['agent_toolbelt']
-            system_prompt = agent['agent_system_prompt']
-            
-            # deep to avoid messing with the original system prompt.
-            conversation = copy.deepcopy(self.conversation.value)
-            
-            if conversation[0]['role'] != 'system':
-                conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+        model_name = agent['agent_model']
+        toolbelt = agent['agent_toolbelt']
+        system_prompt = agent['agent_system_prompt']
+
+        # deep to avoid messing with the original system prompt.
+        conversation = copy.deepcopy(self.conversation.value)
+
+        if conversation[0]['role'] != 'system':
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+        else:
+            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
+
+        thoughts = 0
+        stress_level = 0.0  # Raise temperature if there are failures.
+
+        while thoughts < agent['max_thoughts']:
+            thoughts += 1
+
+            if thoughts == agent['max_thoughts']:
+                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+
+            if agent['agent_provider'] == 'vertexai':
+                response = self.run_vertexai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'openai':
+                response = self.run_openai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'bedrock':
+                response = self.run_bedrock(ctx, model_name, conversation, stress_level)
             else:
-                conversation[0]['content'] =  system_prompt.format(**make_tools_prompt(toolbelt))
+                raise ValueError("Unknown agent provider")
 
-            thoughts = 0
-            stress_level = 0.0 # Raise temperature if there are failures.
-            
-            while thoughts < agent['max_thoughts']:
-                thoughts += 1
+            conversation.append(response)
 
-                if thoughts == agent['max_thoughts']:
-                    conversation.append({"role": "system", "content": "Maximum tool usage reached.  Tools Unavailable"})
+            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
+            else:
+                # Allow only one tool per thought.
+                break
+
+        self.out_conversation.value = conversation
+        self.last_response.value = conversation[-1]['content']
+
+    def run_bedrock(self, ctx, model_name, conversation, stress_level):
+        print(conversation)
+        print("calling anthropic...")
+        
+        bedrock_client = ctx.get('bedrock_client')
+        if bedrock_client is None:
+            raise Exception("Bedrock client has not been authorized")
+
+        if conversation[0]['role'] == 'system':
+            system = conversation[0]['content']
+        else:
+            system = None
+
+        messages = encode_prompt(model_name, conversation[1:])
+
+        body_data = {
+            "system": system,
+            "messages": messages,
+            "max_tokens": 8192,
+            "anthropic_version": "bedrock-2023-05-31"
+        }
+
+        body = json.dumps(body_data)
+        response = bedrock_client.invoke_model(
+            body=body,
+            modelId=model_name,
+            accept="application/json",
+            contentType="application/json"
+        )
+
+        response_body = json.loads(response.get('body').read())
+        content = response_body.get('content')[0]
+        if content['type'] == 'text':
+            text = content['text']
+        else:
+            print(content)
+            raise Exception('Unknown content type returned from model.')
+        response = { "role": "assistant", "content": text }
+
+        print("got response:")
+        print(response)
+        return response
+    
+    def run_vertexai(self, ctx, model_name, conversation, stress_level):
+        inputs = conversation_to_vertexai(conversation)
+        model = GenerativeModel(model_name)
+        result = model.generate_content(
+            inputs,
+            generation_config={
+                "max_output_tokens": 8192,
+                "stop_sequences": [
+                    "\n\nsystem:",
+                    "\n\nuser:",
+                    "\n\nassistant:"
+                ],
+                "temperature": stress_level + 0.5,
+                "top_p": 1
+            },
+            safety_settings=[],
+            stream=False,
+        )
+
+        if "assistant:" in result.text:
+            response = {"role": "assistant", "content": result.text.split("assistant:")[-1]}
+        else:
+            response = {"role": "assistant", "content": result.text}
+        return response
+
+    def run_openai(self, ctx, model_name, conversation, stress_level):
+        print(conversation, flush=True)
+        if conversation[-1]['role'] == 'assistant' and conversation[-1]['content'] == '':
+            conversation.pop()
+
+        if model_name.startswith('o1') or model_name.startswith('o3'):
+            reasoning_effort = 'low'
+            if stress_level > 0.3:
+                reasoning_effort = 'medium'
+            elif stress_level > 0.5:
+                reasoning_effort = 'high'
                 
+            result = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_completion_tokens=8192,
+                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
+                reasoning_effort='low'
+            )
+        else:
+            result = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_tokens=8192,
+                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
+                temperature=stress_level
+            )
+        try:
+            response = result.choices[0].message
+            return {"role": "assistant", "content": response.content}
+        except:
+            print(result, flush=True)
+            return {"role": "assistant", "content": "Error...."}
 
-                inputs = conversation_to_vertexai(conversation)
+    def handle_tool_use(self, ctx, agent, conversation, content, toolbelt, stress_level):        
+        # Save the last response of the agent for on_thought.
+        self.last_response.value = conversation[-1]['content']
 
-                model = GenerativeModel(model_name)
-                result = model.generate_content(
-                    inputs,
-                    generation_config={
-                        "max_output_tokens": 2048,
-                        "stop_sequences": [
-                            "\n\nsystem:",
-                            "\n\nuser:",
-                            "\n\nassistant:"
-                        ],
-                        "temperature": stress_level + 0.5,
-                        "top_p": 1
-                    },
-                    safety_settings=[],
-                    stream=False,
-                )
+        lines = content.split("\n")
+
+        line_num = 0
+        for line in lines:
+            line_num += 1
+            if line.startswith("TOOL:"):
+                #Remove any hallucinated SYSTEM Or other TOOL calls until this line.
+                new_lines = lines[0:line_num] # lines[0:0] = [] 
+                conversation[-1]['content'] = '\n'.join(new_lines)
                 
-                if "assistant:" in result.text:
-                    response = {"role": "assistant", "content": result.text.split("assistant:")[-1]}
+                command = line.split(":", 1)[1].strip()
+                try:
+                    tool_name = command.split(" ", 1)[0].strip()
+                    tool_args = command.split(" ", 1)[1].strip()
+                except Exception:
+                    tool_name = command.strip()
+                    tool_args = ""
+
+                if tool_name == 'lookup_memory':
+                    memory = agent['agent_memory']
+                    try:
+                        obj = json.loads(tool_args)
+                        tool_result = str(memory.query(obj['query'], 3))
+                    except:
+                        tool_result = str(memory.query(tool_args, 3))
+                    print(f"lookup_memory got result:\n{tool_result}", flush=True)
+                    conversation.append({"role": "system", "content": str(tool_result)})
+                elif tool_name == 'create_memory':
+                    try:
+                        obj = json.loads(tool_args)
+                        self.remember_tool(agent, obj, conversation)
+                    except:
+                        self.remember_tool(agent, tool_args, conversation)
                 else:
-                    response = {"role": "assistant", "content": result.text}
-                
-                conversation.append(response)                
-                
-                if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
-
-                    next_action = self.on_thought
-                    while next_action:
-                        next_action = next_action.do(ctx)
+                    stress_level = self.run_tool(toolbelt, tool_name, tool_args, conversation, stress_level)
                     
-                    lines = response['content'].split("\n")
-                    for line in lines:
-                        if line.startswith("TOOL:"):
-                            command = line.split(":", 1)[1].strip()
-                            try:
-                                tool_name = command.split(" ", 1)[0].strip()
-                                tool_args = command.split(" ", 1)[1].strip()
-                            except Exception as e:
-                                tool_name = command.strip()
-                                tool_args = ""
-
-                            if tool_name == 'recall':
-                                memory = agent['agent_memory']
-                                tool_result = str(memory.query(tool_args, 3))
-                                print(f"recall got result: {tool_result}", flush=True)
-                                conversation.append({"role": "system", "content": tool_result})
-                            elif tool_name == 'remember':
-
-                                memory = agent['agent_memory']
-                                prompt_start = tool_args.find('"')
-                                prompt_end = tool_args.find('"', prompt_start)
-                                prompt = tool_args[prompt_start + 1:prompt_end].strip()
-                                memo_start = tool_args.find('"', prompt_end)
-                                memo = tool_args[memo_start + 1:len(tool_args - 1)].replace('\"', '"')
-
-                                try:
-                                    json_memo = json.loads(memo)
-                                except Exception as e:
-                                    # Invalid JSON, so just store as a string.
-                                    json_memo = '"' + memo + '"'
-                                    
-                                memory.add('', prompt, json_memo)
-                                print(f"Added {prompt}: {memo} to memory", flush=True)
-                                conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
-                                
-                            else:
-                                try:
-                                    tool_result = toolbelt[tool_name](tool_args)
-                                    print(f"tool {tool_name} got result:")
-                                    print(tool_result)
-                                    
-                                    conversation.append({"role": "system", "content": tool_result})
-                                except KeyError as e:
-                                    print(f"tool {tool_name} not found.")
-                                    conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
-                                    stress_level = min(stress_level + 0.1, 1.5)
-                                except Exception as e:
-                                    print(f"tool {tool_name} got exception:")
-                                    print(e)
-                                    conversation.append({"role": "system", "content": "ERROR: " + str(e)})
-                                    stress_level = min(stress_level + 0.1, 1.5)
-                else:
-                    # Allow only one tool per thought.
-                    break
-            self.out_conversation.value = conversation
-            self.last_response.value = conversation[-1]['content']
-
-            
-        elif agent['agent_provider'] == 'openai':
-            model_name = agent['agent_model']
-            toolbelt = agent['agent_toolbelt']
-            system_prompt = agent['agent_system_prompt']
-            
-            # deep to avoid messing with the original system prompt.
-            conversation = copy.deepcopy(self.conversation.value)
-            
-            if conversation[0]['role'] != 'system':
-                conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
-            else:
-                conversation[0]['content'] =  system_prompt.format(**make_tools_prompt(toolbelt))
-
-            thoughts = 0
-            stress_level = 0.0 # Raise temperature if there are failures.
-            
-            while thoughts <= agent['max_thoughts']:
-                thoughts += 1
-
-                if thoughts == agent['max_thoughts']:
-                    conversation.append({"role": "system", "content": "Maximum tool usage reached.  Tools Unavailable"})
-                
-                result = openai.chat.completions.create(
-                    model=model_name,
-                    messages=conversation,
-                    max_tokens=2000,
-                    temperature=stress_level
-                )
-                
-                response = result.choices[0].message
-                
-                conversation.append({"role": "assistant", "content": response.content})
-
+                # Give on_thought a chance to see the result of the tool.
                 self.out_conversation.value = conversation
-                self.last_response.value = conversation[-1]['content']
+                SubGraphExecutor(self.on_thought).do(ctx)
 
-                if thoughts <= agent['max_thoughts'] and 'TOOL:' in response.content:
+                # Only allow one tool call. LLMs hallucinate results.                
+                break
 
-                    next_action = self.on_thought
-                    while next_action:
-                        next_action = next_action.do(ctx)
-                    
-                    lines = response.content.split("\n")
-                    for line in lines:
-                        if line.startswith("TOOL:"):
-                            command = line.split(":", 1)[1].strip()
-                            try:
-                                tool_name = command.split(" ", 1)[0].strip()
-                                tool_args = command.split(" ", 1)[1].strip()
-                            except Exception as e:
-                                tool_name = command.strip()
-                                tool_args = ""
+        return stress_level
 
-                            if tool_name == 'recall':
-                                memory = agent['agent_memory']
-                                tool_result = str(memory.query(tool_args, 3))
-                                print(f"recall got result: {tool_result}", flush=True)
-                                conversation.append({"role": "system", "content": tool_result})
-                            elif tool_name == 'remember':
-                                memory = agent['agent_memory']
-                                prompt_start = tool_args.find('"')
-                                prompt_end = tool_args.find('"', prompt_start)
-                                prompt = tool_args[prompt_start + 1:prompt_end].strip()
-                                memo_start = tool_args.find('"', prompt_end)
-                                memo = tool_args[memo_start + 1:len(tool_args - 1)].replace('\"', '"')
+    def remember_tool(self, agent, tool_args, conversation):
+        memory = agent['agent_memory']
+        if isinstance(tool_args, str):
+            prompt_start = tool_args.find('"')
+            prompt_end = tool_args.find('"', prompt_start)
+            prompt = tool_args[prompt_start + 1:prompt_end].strip()
+            memo_start = tool_args.find('"', prompt_end)
+            memo = tool_args[memo_start + 1:len(tool_args) - 1].replace('\"', '"')
+        else:
+            prompt = tool_args['summary']
+            memo = json.dumps(tool_args)
 
-                                try:
-                                    json_memo = json.loads(memo)
-                                except Exception as e:
-                                    # Invalid JSON, so just store as a string.
-                                    json_memo = '"' + memo + '"'
-                                    
-                                memory.add('', prompt, json_memo)
-                                print(f"Added {prompt}: {memo} to memory", flush=True)
-                                conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
-                                
-                            else:
-                                try:
-                                    tool_result = toolbelt[tool_name](tool_args)
-                                    print(f"tool {tool_name} got result:")
-                                    print(tool_result)
-                                    
-                                    conversation.append({"role": "system", "content": tool_result})
-                                except KeyError as e:
-                                    print(f"tool {tool_name} not found.")
-                                    conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
-                                    stress_level = min(stress_level + 0.1, 1.5)
-                                except Exception as e:
-                                    print(f"tool {tool_name} got exception:")
-                                    print(e)
-                                    conversation.append({"role": "system", "content": "ERROR: " + str(e)})
-                                    stress_level = min(stress_level + 0.1, 1.5)
+        try:
+            json_memo = json.loads(memo)
+        except Exception:
+            # Invalid JSON, so just store as a string.
+            json_memo = '"' + memo + '"'
+
+        memory.add('', prompt, json_memo)
+        print(f"Added {prompt}: {memo} to memory", flush=True)
+        conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+
+    def run_tool(self, toolbelt, tool_name, tool_args, conversation, stress_level):
+        try:
+            tool = toolbelt[tool_name]
+        except KeyError as e:
+            print(f"tool {tool_name} not found.")
+            conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
+            return min(stress_level + 0.1, 1.5)
+            
+        try:
+            tool_result = tool(tool_args)
+            print(f"tool {tool_name} got result:")
+            print(tool_result)
+
+            if str(tool_result) != '':
+                conversation.append({"role": "system", "content": str(tool_result)})
+            else:
+                conversation.append({"role": "system", "content": 'Empty string result'})
+
+            return stress_level        
+        except Exception as e:
+            print(f"tool {tool_name} got exception:")
+            traceback.print_exc()
+            conversation.append({"role": "system", "content": "ERROR: " + str(e)})
+        return min(stress_level + 0.1, 1.5)
+
+@xai_component
+class AgentLearn(Component):
+    """Run the agent with the given conversation.
+
+    ##### branches:
+    - on_thought: Called whenever the agent uses a tool.
+
+    ##### inPorts:
+    - agent_name: The name of the agent to run.
+    - conversation: The conversation to send to the agent.
+
+    ##### outPorts:
+    - out_conversation: The conversation with the agent's responses.
+    - last_response: The last response of the agent.
+
+    """
+    on_thought: BaseComponent
+
+    agent_name: InCompArg[str]
+    conversation: InCompArg[any]
+
+    out_conversation: OutArg[list]
+    last_response: OutArg[str]
+
+    def execute(self, ctx) -> None:
+        agent = ctx['agent_' + self.agent_name.value]
+
+        model_name = agent['agent_model']
+        toolbelt = agent['agent_toolbelt']
+        system_prompt = agent['agent_system_prompt']
+
+        # Deep copy to avoid messing with the original system prompt.
+        conversation = copy.deepcopy(self.conversation.value)
+
+        if conversation[0]['role'] != 'system':
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+        else:
+            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
+
+        # Add system message to use memory tools
+        memory_instruction = {
+            "role": "system",
+            "content": "Use memory tools to review the conversation so far. Learn from it by updating existing memories or creating new ones. Then, respond with a summary of what you have learned."
+        }
+        conversation.append(memory_instruction)
+
+        thoughts = 0
+        stress_level = 0.0  # Raise temperature if there are failures.
+
+        while thoughts < agent['max_thoughts']:
+            thoughts += 1
+
+            if thoughts == agent['max_thoughts']:
+                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+
+            if agent['agent_provider'] == 'vertexai':
+                response = self.run_vertexai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'openai':
+                response = self.run_openai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'bedrock':
+                response = self.run_bedrock(ctx, model_name, conversation, stress_level)
+            else:
+                raise ValueError("Unknown agent provider")
+
+            conversation.append(response)
+
+            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
+            else:
+                # Allow only one tool per thought.
+                break
+
+        # Final thoughts: Instruct the agent to summarize what it has learned
+        summary_instruction = {
+            "role": "system",
+            "content": "Summarize your learnings from the conversation and how it will influence your future interactions."
+        }
+        
+        conversation.append(summary_instruction)
+        if agent['agent_provider'] == 'vertexai':
+            response = self.run_vertexai(ctx, model_name, conversation, stress_level)
+        elif agent['agent_provider'] == 'openai':
+            response = self.run_openai(ctx, model_name, conversation, stress_level)
+        elif agent['agent_provider'] == 'bedrock':
+            response = self.run_bedrock(ctx, model_name, conversation, stress_level)
+        else:
+            raise ValueError("Unknown agent provider")
+
+        conversation.append(response)
+
+        self.out_conversation.value = conversation
+        self.last_response.value = conversation[-1]['content']
+        
+    def execute_orig(self, ctx) -> None:
+        agent = ctx['agent_' + self.agent_name.value]
+
+        model_name = agent['agent_model']
+        toolbelt = agent['agent_toolbelt']
+        system_prompt = agent['agent_system_prompt']
+
+        # deep to avoid messing with the original system prompt.
+        conversation = copy.deepcopy(self.conversation.value)
+
+        if conversation[0]['role'] != 'system':
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+        else:
+            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
+
+        
+
+        thoughts = 0
+        stress_level = 0.0  # Raise temperature if there are failures.
+
+        while thoughts < agent['max_thoughts']:
+            thoughts += 1
+
+            if thoughts == agent['max_thoughts']:
+                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+
+            if agent['agent_provider'] == 'vertexai':
+                response = self.run_vertexai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'openai':
+                response = self.run_openai(ctx, model_name, conversation, stress_level)
+            elif agent['agent_provider'] == 'bedrock':
+                response = self.run_bedrock(ctx, model_name, conversation, stress_level)
+            else:
+                raise ValueError("Unknown agent provider")
+
+            conversation.append(response)
+
+            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
+            else:
+                # Allow only one tool per thought.
+                break
+
+        self.out_conversation.value = conversation
+        self.last_response.value = conversation[-1]['content']
+
+    def run_bedrock(self, ctx, model_name, conversation, stress_level):
+        print(conversation)
+        print("calling anthropic...")
+        
+        bedrock_client = ctx.get('bedrock_client')
+        if bedrock_client is None:
+            raise Exception("Bedrock client has not been authorized")
+
+        if conversation[0]['role'] == 'system':
+            system = conversation[0]['content']
+        else:
+            system = None
+
+        messages = encode_prompt(model_name, conversation[1:])
+
+        body_data = {
+            "system": system,
+            "messages": messages,
+            "max_tokens": 8192,
+            "anthropic_version": "bedrock-2023-05-31"
+        }
+
+        body = json.dumps(body_data)
+        response = bedrock_client.invoke_model(
+            body=body,
+            modelId=model_name,
+            accept="application/json",
+            contentType="application/json"
+        )
+
+        response_body = json.loads(response.get('body').read())
+        content = response_body.get('content')[0]
+        if content['type'] == 'text':
+            text = content['text']
+        else:
+            print(content)
+            raise Exception('Unknown content type returned from model.')
+        response = { "role": "assistant", "content": text }
+
+        print("got response:")
+        print(response)
+        return response
+    
+    def run_vertexai(self, ctx, model_name, conversation, stress_level):
+        inputs = conversation_to_vertexai(conversation)
+        model = GenerativeModel(model_name)
+        result = model.generate_content(
+            inputs,
+            generation_config={
+                "max_output_tokens": 8192,
+                "stop_sequences": [
+                    "\n\nsystem:",
+                    "\n\nuser:",
+                    "\n\nassistant:"
+                ],
+                "temperature": stress_level + 0.5,
+                "top_p": 1
+            },
+            safety_settings=[],
+            stream=False,
+        )
+
+        if "assistant:" in result.text:
+            response = {"role": "assistant", "content": result.text.split("assistant:")[-1]}
+        else:
+            response = {"role": "assistant", "content": result.text}
+        return response
+
+    def run_openai(self, ctx, model_name, conversation, stress_level):
+        print(conversation, flush=True)
+        if conversation[-1]['role'] == 'assistant' and conversation[-1]['content'] == '':
+            conversation.pop()
+
+        if model_name.startswith('o1') or model_name.startswith('o3'):
+            reasoning_effort = 'low'
+            if stress_level > 0.3:
+                reasoning_effort = 'medium'
+            elif stress_level > 0.5:
+                reasoning_effort = 'high'
+                
+            result = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_completion_tokens=8192,
+                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
+                reasoning_effort='low'
+            )
+        else:
+            result = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_tokens=8192,
+                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
+                temperature=stress_level
+            )
+        try:
+            response = result.choices[0].message
+            return {"role": "assistant", "content": response.content}
+        except:
+            print(result, flush=True)
+            return {"role": "assistant", "content": "Error...."}
+
+    def handle_tool_use(self, ctx, agent, conversation, content, toolbelt, stress_level):        
+        # Save the last response of the agent for on_thought.
+        self.last_response.value = conversation[-1]['content']
+
+        lines = content.split("\n")
+
+        line_num = 0
+        for line in lines:
+            line_num += 1
+            if line.startswith("TOOL:"):
+                #Remove any hallucinated SYSTEM Or other TOOL calls until this line.
+                new_lines = lines[0:line_num] # lines[0:0] = [] 
+                conversation[-1]['content'] = '\n'.join(new_lines)
+                
+                command = line.split(":", 1)[1].strip()
+                try:
+                    tool_name = command.split(" ", 1)[0].strip()
+                    tool_args = command.split(" ", 1)[1].strip()
+                except Exception:
+                    tool_name = command.strip()
+                    tool_args = ""
+
+                if tool_name == 'lookup_memory':
+                    memory = agent['agent_memory']
+                    try:
+                        obj = json.loads(tool_args)
+                        tool_result = str(memory.query(obj['query'], 3))
+                    except:
+                        tool_result = str(memory.query(tool_args, 3))
+                    print(f"lookup_memory got result:\n{tool_result}", flush=True)
+                    conversation.append({"role": "system", "content": str(tool_result)})
+                elif tool_name == 'create_memory':
+                    try:
+                        obj = json.loads(tool_args)
+                        self.remember_tool(agent, obj, conversation)
+                    except:
+                        self.remember_tool(agent, tool_args, conversation)
                 else:
-                    # Allow only one tool per thought.
-                    break
+                    stress_level = self.run_tool(toolbelt, tool_name, tool_args, conversation, stress_level)
+                    
+                # Give on_thought a chance to see the result of the tool.
+                self.out_conversation.value = conversation
+                SubGraphExecutor(self.on_thought).do(ctx)
 
-            self.out_conversation.value = conversation
-            self.last_response.value = conversation[-1]['content']
+                # Only allow one tool call. LLMs hallucinate results.                
+                break
 
+        return stress_level
+
+    def remember_tool(self, agent, tool_args, conversation):
+        memory = agent['agent_memory']
+        if isinstance(tool_args, str):
+            prompt_start = tool_args.find('"')
+            prompt_end = tool_args.find('"', prompt_start)
+            prompt = tool_args[prompt_start + 1:prompt_end].strip()
+            memo_start = tool_args.find('"', prompt_end)
+            memo = tool_args[memo_start + 1:len(tool_args) - 1].replace('\"', '"')
+        else:
+            prompt = tool_args['summary']
+            memo = json.dumps(tool_args)
+
+        try:
+            json_memo = json.loads(memo)
+        except Exception:
+            # Invalid JSON, so just store as a string.
+            json_memo = '"' + memo + '"'
+
+        memory.add('', prompt, json_memo)
+        print(f"Added {prompt}: {memo} to memory", flush=True)
+        conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+
+    def run_tool(self, toolbelt, tool_name, tool_args, conversation, stress_level):
+        try:
+            tool = toolbelt[tool_name]
+        except KeyError as e:
+            print(f"tool {tool_name} not found.")
+            conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
+            return min(stress_level + 0.1, 1.5)
+            
+        try:
+            tool_result = tool(tool_args)
+            print(f"tool {tool_name} got result:")
+            print(tool_result)
+
+            if str(tool_result) != '':
+                conversation.append({"role": "system", "content": str(tool_result)})
+            else:
+                conversation.append({"role": "system", "content": 'Empty string result'})
+
+            return stress_level        
+        except Exception as e:
+            print(f"tool {tool_name} got exception:")
+            traceback.print_exc()
+            conversation.append({"role": "system", "content": "ERROR: " + str(e)})
+        return min(stress_level + 0.1, 1.5)
 
 def word_or_pair_generator(input_string):
     words = input_string.split(' ')
@@ -634,4 +1053,3 @@ class AgentStreamStringResponse(Component):
     
     def execute(self, ctx) -> None:
         self.result_stream.value = word_or_pair_generator(self.input_str.value)
-
