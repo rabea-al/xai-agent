@@ -2348,8 +2348,8 @@
                                 "98ba8445-13d2-463b-bb4e-49927f815b07"
                             ],
                             "in": false,
-                            "label": "gpt-3.5-turbo",
-                            "varName": "gpt-3.5-turbo",
+                            "label": "gpt-4o-mini",
+                            "varName": "gpt-4o-mini",
                             "portType": "",
                             "dataType": "string"
                         }
