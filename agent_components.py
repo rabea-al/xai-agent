@@ -679,6 +679,68 @@ class AgentRun(Component):
             conversation.append({"role": "system", "content": "ERROR: " + str(e)})
         return min(stress_level + 0.1, 1.5)
 
+
+@xai_component
+class AgentRunTool(Component):
+    """Run a specified tool manually and append the result to a copy of the conversation.
+
+    ##### inPorts:
+    - agent_name: The agent whose toolbelt will be used.
+    - tool_name: The name of the tool to run.
+    - tool_args: The arguments for the tool, passed as is if str or converted to JSON otherwise.
+    - conversation: The current conversation to update.
+
+    ##### outPorts:
+    - tool_output: The raw output from the tool.
+    - updated_conversation: The updated conversation after running the tool.
+    """
+
+    agent_name: InCompArg[str]
+    tool_name: InCompArg[str]
+    tool_args: InArg[any]
+    conversation: InCompArg[list]
+
+    tool_output: OutArg[str]
+    updated_conversation: OutArg[list]
+
+    def execute(self, ctx) -> None:
+        agent = ctx['agent_' + self.agent_name.value]
+        toolbelt = agent['agent_toolbelt']
+
+        current_conversation = self.conversation.value.copy()  # Create a copy of the conversation
+
+        try:
+            tool = toolbelt[self.tool_name.value]
+
+            if self.tool_args.value is None:
+                args = ""
+            if isinstance(self.tool_args.value, str):
+                args = self.tool_args.value
+            else:
+                args = json.dumps(self.tool_args.value)
+                
+            tool_result = tool(args)
+
+            # Append the tool usage to the copied conversation
+            current_conversation.append({"role": "assistant", "content": f"TOOL: {self.tool_name.value} {self.tool_args.value}"})
+
+            if tool_result != '':
+                current_conversation.append({"role": "system", "content": str(tool_result)})
+            else:
+                current_conversation.append({"role": "system", "content": 'Empty string result'})
+
+            self.tool_output.value = str(tool_result)
+            self.updated_conversation.value = current_conversation
+        except KeyError:
+            error_message = f"ERROR: TOOL '{self.tool_name.value}' not found."
+            current_conversation.append({"role": "system", "content": error_message})
+            self.updated_conversation.value = current_conversation
+        except Exception as e:
+            error_message = f"ERROR: An exception occurred while running the tool: {str(e)}"
+            current_conversation.append({"role": "system", "content": error_message})
+            self.updated_conversation.value = current_conversation
+
+
 @xai_component
 class AgentLearn(Component):
     """Run the agent with the given conversation.
