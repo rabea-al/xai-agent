@@ -454,6 +454,170 @@ class AgentUpdate(Component):
             agent['agent_system_prompt'] = self.new_system_prompt.value
 
 
+
+@xai_component(type="Start", color="purple") # Using purple for Start nodes
+class AgentDefineRoute(Component):
+    """Defines the starting point for a specific agent processing flow.
+    The AgentRouter can use the name and description to select this flow.
+
+    ##### inPorts:
+    - agent_flow_name: A unique name for this agent route.
+    - description: A description of what this agent route does, used by the router.
+    """
+    agent_flow_name: InCompArg[str]
+    description: InCompArg[str]
+
+    # This component doesn't have direct outputs, it triggers a subgraph execution.
+
+    def init(self, ctx):
+        super().init(ctx)
+        if not self.agent_flow_name.value:
+            print("Warning: AgentDefineRoute requires an agent_flow_name.")
+            return
+        # Register this start point for the router
+        start_points = ctx.setdefault('registered_agent_routes', {})
+        start_points[self.agent_flow_name.value] = {
+            'description': self.description.value,
+            'component': self
+        }
+        print(f"Registered agent start: {self.agent_flow_name.value}")
+
+
+    def execute(self, ctx) -> None:
+        # This method is called when the router selects this flow.
+        # The actual agent logic starts from the components connected *after* this one.
+        # The conversation should ideally be passed through the context by the router.
+        print(f"Executing AgentDefineRoute: {self.agent_flow_name.value}")
+        # The SubGraphExecutor in AgentRouter will handle running the subsequent components.
+        pass
+
+
+@xai_component
+class AgentRouter(Component):
+    """An agent that routes a conversation to a specific agent route based on available AgentDefineRoute components.
+
+    It uses its own configured agent (specified by agent_name) to decide which flow is most appropriate.
+
+    ##### inPorts:
+    - agent_name: The name of the agent configuration to use for the routing decision.
+    - conversation: The conversation history to be routed.
+    - final_context_key: The key in the context where the chosen agent route is expected to place its final result (default: 'agent_flow_result').
+
+
+    ##### outPorts:
+    - result: The final result produced by the selected agent route.
+    - chosen_flow_name: The name of the agent route that was chosen.
+    """
+    agent_name: InCompArg[str]
+    conversation: InArg[list]
+    final_context_key: InArg[str]
+
+    result: OutArg[any]
+    chosen_flow_name: OutArg[str]
+
+    # Reusing parts of AgentRun's logic for the LLM call might be needed.
+    # For simplicity, let's define a basic LLM call here.
+    # This assumes access to similar helper functions or context setup as AgentRun.
+
+    def execute(self, ctx) -> None:
+        agent_context_key = 'agent_' + self.agent_name.value
+        if agent_context_key not in ctx:
+            raise ValueError(f"Agent configuration '{self.agent_name.value}' not found. Initialize it with AgentInit first.")
+
+        agent_config = ctx[agent_context_key]
+        provider = agent_config['agent_provider']
+        model_name = agent_config['agent_model']
+
+        # 1. Find available agent routes (AgentDefineRoute components)
+        registered_starts = ctx.get('registered_agent_routes', {})
+        if not registered_starts:
+            raise ValueError("No agent routes (AgentDefineRoute components) found registered in the context.")
+
+        # 2. Prepare descriptions for the routing prompt
+        flow_descriptions = []
+        for name, data in registered_starts.items():
+            flow_descriptions.append(f"- Name: {name}\n  Description: {data['description']}")
+        
+        available_flows_text = "\n".join(flow_descriptions)
+
+        # 3. Construct the prompt for the router agent
+        routing_prompt = f"""You are a routing agent. Based on the following conversation history, choose the most appropriate agent route to handle the latest user request.
+
+Conversation History:
+{json.dumps(self.conversation.value, indent=2)}
+
+Available agent routes:
+{available_flows_text}
+
+Respond ONLY with the exact 'Name' of the best agent route to use. Do not add any explanation or other text."""
+
+        # Prepare conversation for the LLM call
+        router_conversation = [
+            {"role": "system", "content": "You are an expert routing agent."}, # Basic system prompt
+            {"role": "user", "content": routing_prompt}
+        ]
+
+        # 4. Call the LLM using the shared dispatch function
+        chosen_flow = None
+        print(f"Attempting routing with provider: {provider}, model: {model_name}")
+        try:
+            # Use a low temperature for deterministic routing
+            response = _dispatch_llm_call(ctx, provider, model_name, router_conversation, temperature=0.1)
+            chosen_flow = response['content'].strip()
+        except Exception as e:
+            print(f"Error calling LLM for routing via provider {provider}: {e}")
+            traceback.print_exc()
+            raise ConnectionError(f"Failed to get routing decision from {provider}: {e}")
+
+        if not chosen_flow or chosen_flow not in registered_starts:
+            available_keys = list(registered_starts.keys())
+            # Sometimes the model might return the name in quotes, try stripping them
+            if chosen_flow and chosen_flow.startswith('"') and chosen_flow.endswith('"'):
+                chosen_flow = chosen_flow[1:-1]
+            elif chosen_flow and chosen_flow.startswith("'") and chosen_flow.endswith("'"):
+                 chosen_flow = chosen_flow[1:-1]
+
+            if not chosen_flow or chosen_flow not in available_keys:
+                 print(f"Router LLM returned an invalid route name: '{chosen_flow}'. Available: {available_keys}")
+                 raise ValueError(f"AgentRouter failed to select a valid agent route. Response: '{chosen_flow}'")
+
+        print(f"AgentRouter chose route: {chosen_flow}")
+        self.chosen_flow_name.value = chosen_flow
+
+        # 5. Get the chosen AgentDefineRoute component
+        chosen_start_component = registered_starts[chosen_flow]['component']
+
+        # 6. Execute the chosen subgraph
+        ctx['current_conversation_for_flow'] = self.conversation.value
+        result_key = self.final_context_key.value if self.final_context_key.value else 'agent_flow_result'
+        ctx[result_key] = None # Clear any previous result
+
+        print(f"Executing subgraph starting from: {chosen_flow}")
+        try:
+            # Execute the graph starting from the component *after* the AgentDefineRoute node
+            if chosen_start_component.next:
+                 SubGraphExecutor(chosen_start_component.next).do(ctx)
+            else:
+                 print(f"Warning: Chosen AgentDefineRoute '{chosen_flow}' has no connected components to execute.")
+                 # Set a default result or handle as needed
+                 ctx[result_key] = "No components connected to the chosen start flow."
+
+        except Exception as e:
+            print(f"Error executing chosen agent route '{chosen_flow}': {e}")
+            traceback.print_exc()
+            self.result.value = f"Error during execution of flow '{chosen_flow}': {e}"
+            raise # Re-raise to signal failure upstream
+
+        # 7. Retrieve the result from the context
+        final_result = ctx.get(result_key)
+        print(f"Subgraph execution finished. Result found in ctx['{result_key}']: {final_result}")
+        self.result.value = final_result
+
+        # Optional: Clean up context
+        # if 'current_conversation_for_flow' in ctx: del ctx['current_conversation_for_flow']
+        # if result_key in ctx: del ctx[result_key]
+
+
 # Placeholder for querying core system about MCP tools
 # In a real implementation, this would interact with the framework/environment
 def query_core_system_for_mcp_tools(server_name: str) -> list:
@@ -532,6 +696,168 @@ class AgentMergeSystem(Component):
         self.out_conversation.value = conversation
 
 
+# --- Standalone LLM Call Functions ---
+
+def _run_llm_bedrock(ctx, model_name, conversation, temperature):
+    """Calls the Bedrock API (Anthropic models)."""
+    print("Calling Bedrock (Anthropic)...")
+    # Ensure bedrock_client is available in context (initialized elsewhere)
+    bedrock_client = ctx.get('bedrock_client')
+    if bedrock_client is None:
+        raise Exception("Bedrock client has not been authorized or is not found in context.")
+
+    system = conversation[0]['content'] if conversation and conversation[0]['role'] == 'system' else None
+    # Pass only non-system messages to encode_prompt if it expects that
+    messages_to_encode = conversation[1:] if system else conversation
+    messages = encode_prompt(model_name, messages_to_encode) # Assumes encode_prompt handles the format
+
+    body_data = {
+        "messages": messages,
+        "max_tokens": 8192, # Consider making this configurable
+        "temperature": temperature,
+        "anthropic_version": "bedrock-2023-05-31" # Check if this needs updates for newer models
+    }
+    # Conditionally add system prompt if it exists
+    if system:
+        body_data["system"] = system
+
+    body = json.dumps(body_data)
+
+    try:
+        api_response = bedrock_client.invoke_model(
+            body=body,
+            modelId=model_name,
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(api_response.get('body').read())
+
+        # Handle potential variations in response structure (Anthropic specific)
+        if 'content' in response_body and isinstance(response_body['content'], list) and len(response_body['content']) > 0:
+             content_block = response_body['content'][0]
+             if content_block.get('type') == 'text':
+                 text = content_block['text']
+             else:
+                 # Handle other content types if necessary (e.g., tool_use)
+                 print(f"Warning: Bedrock returned non-text content block: {content_block}")
+                 text = json.dumps(content_block) # Or handle appropriately
+        elif 'completion' in response_body: # Older completion-style response (less likely for Claude 3+)
+             text = response_body['completion']
+        else:
+             print(f"Warning: Unexpected Bedrock response structure: {response_body}")
+             raise Exception('Unknown content structure returned from Bedrock model.')
+
+        response = {"role": "assistant", "content": text}
+        print("Bedrock response processed.")
+        return response
+    except Exception as e:
+        print(f"Error during Bedrock API call: {e}")
+        traceback.print_exc()
+        raise # Re-raise the exception
+
+
+def _run_llm_vertexai(ctx, model_name, conversation, temperature):
+    """Calls the Vertex AI API."""
+    print("Calling Vertex AI...")
+    if 'vertexai' not in globals() or 'GenerativeModel' not in globals():
+        raise ImportError("Vertex AI library not available or GenerativeModel not imported.")
+
+    # Convert conversation format if necessary (using existing helper)
+    # Ensure conversation_to_vertexai handles the specific format needed by the model
+    inputs = conversation_to_vertexai(conversation)
+    model = GenerativeModel(model_name)
+
+    try:
+        result = model.generate_content(
+            inputs,
+            generation_config={
+                "max_output_tokens": 8192, # Consider making configurable
+                "stop_sequences": ["\n\nsystem:", "\n\nuser:", "\n\nassistant:"], # Standard stops
+                "temperature": temperature,
+                "top_p": 1 # Often recommended to adjust temp OR top_p, not both heavily
+            },
+            safety_settings=[], # Adjust as needed
+            stream=False,
+        )
+        # Safely access text, handling potential errors or empty responses
+        text_response = getattr(result, 'text', '')
+        if not text_response and hasattr(result, 'candidates') and result.candidates:
+             # Try getting content from the first candidate if text is empty
+             first_candidate = result.candidates[0]
+             if hasattr(first_candidate, 'content') and hasattr(first_candidate.content, 'parts'):
+                 text_response = "".join(part.text for part in first_candidate.content.parts if hasattr(part, 'text'))
+
+
+        # Basic parsing, might need refinement based on how Vertex returns roles
+        # Vertex might just return the assistant's text directly without the role prefix
+        response_content = text_response.strip()
+
+
+        response = {"role": "assistant", "content": response_content}
+        print("Vertex AI response processed.")
+        return response
+    except Exception as e:
+        print(f"Error during Vertex AI API call: {e}")
+        traceback.print_exc()
+        raise # Re-raise the exception
+
+
+def _run_llm_openai(ctx, model_name, conversation, temperature):
+    """Calls the OpenAI API."""
+    print("Calling OpenAI...")
+    if 'openai' not in globals():
+        raise ImportError("OpenAI library not available or imported.")
+
+    # Clean conversation: remove trailing empty assistant message if present
+    if conversation and conversation[-1]['role'] == 'assistant' and not conversation[-1]['content']:
+        conversation = conversation[:-1]
+
+    # Basic parameters
+    params = {
+        "model": model_name,
+        "messages": conversation,
+        "max_tokens": 8192, # Consider making configurable
+        "stop": ["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"], # Standard stops
+        "temperature": temperature
+    }
+
+    # Add model-specific parameters if needed (e.g., reasoning_effort)
+    # Example:
+    # if model_name.startswith('o1') or model_name.startswith('o3'):
+    #     params['reasoning_effort'] = 'low' # Or determine based on temp/stress
+
+    try:
+        completion = openai.chat.completions.create(**params)
+        # Ensure message content is accessed correctly
+        response_content = ""
+        if completion.choices and completion.choices[0].message:
+             response_content = completion.choices[0].message.content or "" # Handle None content
+
+        response = {"role": "assistant", "content": response_content}
+        print("OpenAI response processed.")
+        return response
+    except Exception as e:
+        print(f"Error during OpenAI API call: {e}")
+        traceback.print_exc()
+        raise # Re-raise the exception
+
+
+def _dispatch_llm_call(ctx, provider, model_name, conversation, temperature):
+    """Dispatches the LLM call to the appropriate provider function."""
+    print(f"Dispatching LLM call to provider: {provider}")
+    if provider == 'openai':
+        return _run_llm_openai(ctx, model_name, conversation, temperature)
+    elif provider == 'vertexai':
+        return _run_llm_vertexai(ctx, model_name, conversation, temperature)
+    elif provider == 'bedrock':
+        return _run_llm_bedrock(ctx, model_name, conversation, temperature)
+    else:
+        raise ValueError(f"Unsupported LLM provider in dispatch: {provider}")
+
+
+# --- End Standalone LLM Call Functions ---
+
+
 @xai_component
 class AgentRun(Component):
     """Run the agent with the given conversation.
@@ -598,18 +924,25 @@ class AgentRun(Component):
             if thoughts == agent['max_thoughts']:
                 conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
-            if agent['agent_provider'] == 'vertexai':
-                response = self.run_vertexai(ctx, model_name, conversation, stress_level)
-            elif agent['agent_provider'] == 'openai':
-                response = self.run_openai(ctx, model_name, conversation, stress_level)
-            elif agent['agent_provider'] == 'bedrock':
-                response = self.run_bedrock(ctx, model_name, conversation, stress_level)
-            else:
-                raise ValueError("Unknown agent provider")
+            # Call the LLM using the dispatch function
+            try:
+                response = _dispatch_llm_call(
+                    ctx,
+                    agent['agent_provider'],
+                    model_name,
+                    conversation,
+                    temperature=stress_level + 0.5 # Default temperature logic
+                )
+            except Exception as e:
+                 print(f"Error during LLM call in AgentRun: {e}")
+                 traceback.print_exc()
+                 # Decide how to handle the error, e.g., append an error message or raise
+                 conversation.append({"role": "system", "content": f"Error communicating with LLM: {e}"})
+                 break # Exit the loop on LLM error
 
             conversation.append(response)
 
-            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
+            if thoughts <= agent['max_thoughts'] and response.get('content') and 'TOOL:' in response['content']:
                 stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level)
             else:
                 # Allow only one tool per thought.
@@ -618,107 +951,7 @@ class AgentRun(Component):
         self.out_conversation.value = conversation
         self.last_response.value = conversation[-1]['content']
 
-    def run_bedrock(self, ctx, model_name, conversation, stress_level):
-        print(conversation)
-        print("calling anthropic...")
-        
-        bedrock_client = ctx.get('bedrock_client')
-        if bedrock_client is None:
-            raise Exception("Bedrock client has not been authorized")
-
-        if conversation[0]['role'] == 'system':
-            system = conversation[0]['content']
-        else:
-            system = None
-
-        messages = encode_prompt(model_name, conversation[1:])
-
-        body_data = {
-            "system": system,
-            "messages": messages,
-            "max_tokens": 8192,
-            "anthropic_version": "bedrock-2023-05-31"
-        }
-
-        body = json.dumps(body_data)
-        response = bedrock_client.invoke_model(
-            body=body,
-            modelId=model_name,
-            accept="application/json",
-            contentType="application/json"
-        )
-
-        response_body = json.loads(response.get('body').read())
-        content = response_body.get('content')[0]
-        if content['type'] == 'text':
-            text = content['text']
-        else:
-            print(content)
-            raise Exception('Unknown content type returned from model.')
-        response = { "role": "assistant", "content": text }
-
-        print("got response:")
-        print(response)
-        return response
-    
-    def run_vertexai(self, ctx, model_name, conversation, stress_level):
-        inputs = conversation_to_vertexai(conversation)
-        model = GenerativeModel(model_name)
-        result = model.generate_content(
-            inputs,
-            generation_config={
-                "max_output_tokens": 8192,
-                "stop_sequences": [
-                    "\n\nsystem:",
-                    "\n\nuser:",
-                    "\n\nassistant:"
-                ],
-                "temperature": stress_level + 0.5,
-                "top_p": 1
-            },
-            safety_settings=[],
-            stream=False,
-        )
-
-        if "assistant:" in result.text:
-            response = {"role": "assistant", "content": result.text.split("assistant:")[-1]}
-        else:
-            response = {"role": "assistant", "content": result.text}
-        return response
-
-    def run_openai(self, ctx, model_name, conversation, stress_level):
-        print(conversation, flush=True)
-        if conversation[-1]['role'] == 'assistant' and conversation[-1]['content'] == '':
-            conversation.pop()
-
-        if model_name.startswith('o1') or model_name.startswith('o3'):
-            reasoning_effort = 'low'
-            if stress_level > 0.3:
-                reasoning_effort = 'medium'
-            elif stress_level > 0.5:
-                reasoning_effort = 'high'
-                
-            result = openai.chat.completions.create(
-                model=model_name,
-                messages=conversation,
-                max_completion_tokens=8192,
-                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
-                reasoning_effort='low'
-            )
-        else:
-            result = openai.chat.completions.create(
-                model=model_name,
-                messages=conversation,
-                max_tokens=8192,
-                stop=["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
-                temperature=stress_level
-            )
-        try:
-            response = result.choices[0].message
-            return {"role": "assistant", "content": response.content}
-        except:
-            print(result, flush=True)
-            return {"role": "assistant", "content": "Error...."}
+    # Note: run_bedrock, run_vertexai, run_openai methods are removed.
 
     # Placeholder for querying core system about which server provides a tool
     def query_core_system_for_mcp_tool_server(self, tool_name: str) -> str | None:
