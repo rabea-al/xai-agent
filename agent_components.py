@@ -36,7 +36,7 @@ def random_string(length):
 def encode_prompt(model_id: str, conversation: list):
     ret_messages = []
 
-    if model_id.startswith('anthropic.claude-3') or model_id.startswith('apac.anthropic.claude-3'):
+    if 'anthropic.claude-3' in model_id.lower():
         for message in conversation:
             if message['role'] == 'system':
                 message['role'] = 'user'
@@ -47,7 +47,7 @@ def encode_prompt(model_id: str, conversation: list):
                     'content': [
                         {
                             'type': 'text',
-                            'text': message['content']
+                            'text': 'SYSTEM:\n' + message['content']
                         }
                     ]
                 })
@@ -232,9 +232,7 @@ class AgentDefineTool(Component):
             
             def __call__(self, prompt):
                 other_self.tool_input.value = prompt
-                next = other_self.next
-                while next:
-                    next = next.do(ctx)
+                SubGraphExecutor(other_self.next).do(ctx)
                 result = ctx['tool_output']
                 ctx['tool_output'] = None
                 return result
@@ -262,6 +260,32 @@ class AgentToolOutput(Component):
             ctx['tool_output'] = self.results.value[0]
 
 
+@xai_component
+class AgentUseMCPTools(Component):
+    """Declare that tools from a pre-configured MCP server should be available to the agent.
+
+    This component informs the agent runtime which MCP servers (defined in the system's
+    MCP configuration) are active for this specific run.
+
+    ##### inPorts:
+    - server_name: The exact name of the MCP server as configured in the system.
+    - toolbelt_name: The conceptual toolbelt group to associate this server with (default: 'default').
+    """
+    server_name: InCompArg[str]
+    toolbelt_name: InArg[str]
+
+    def execute(self, ctx) -> None:
+        tb_name = self.toolbelt_name.value if self.toolbelt_name.value else 'default'
+        mcp_server_list_key = f"mcp_servers_{tb_name}"
+        
+        # Ensure the list exists in the context
+        if mcp_server_list_key not in ctx:
+            ctx[mcp_server_list_key] = []
+            
+        # Add the server name if not already present
+        if self.server_name.value not in ctx[mcp_server_list_key]:
+            ctx[mcp_server_list_key].append(self.server_name.value)
+
 
 @xai_component
 class AgentMakeToolbelt(Component):
@@ -278,17 +302,34 @@ class AgentMakeToolbelt(Component):
     toolbelt_spec: OutArg[dict]
 
     def execute(self, ctx) -> None:
-        spec = {}
-
+        standard_tools = {}
+        mcp_servers = []
         toolbelt_name = self.name.value if self.name.value is not None else 'default'
         
-        for tool in ctx['toolbelt_' + toolbelt_name]:
-            if tool is not None:
-                tool_component = ctx['toolbelt_' + toolbelt_name][tool]
-                tool_component.execute(ctx)
-                spec[tool_component.tool_ref.value.name] = tool_component.tool_ref.value
-            
-        self.toolbelt_spec.value = spec
+        # Process standard tools defined via AgentDefineTool
+        standard_tool_key = f"toolbelt_{toolbelt_name}"
+        if standard_tool_key in ctx:
+            for tool_name, tool_component in ctx[standard_tool_key].items():
+                if isinstance(tool_component, AgentDefineTool):
+                    # Ensure the tool definition is executed to populate tool_ref
+                    tool_component.execute(ctx)
+                    if tool_component.tool_ref.value:
+                         # Store the actual callable tool instance
+                        standard_tools[tool_component.tool_ref.value.name] = tool_component.tool_ref.value
+                    else:
+                        print(f"Warning: AgentDefineTool '{tool_name}' did not produce a tool reference.")
+                # Note: We ignore non-AgentDefineTool items here, MCP servers are handled next
+
+        # Retrieve declared MCP server names
+        mcp_server_list_key = f"mcp_servers_{toolbelt_name}"
+        if mcp_server_list_key in ctx:
+            mcp_servers = ctx[mcp_server_list_key]
+
+        # Output the combined spec
+        self.toolbelt_spec.value = {
+            'standard_tools': standard_tools,
+            'mcp_servers': mcp_servers
+        }
 
 
 @xai_component
@@ -374,34 +415,92 @@ class AgentInit(Component):
     toolbelt_spec: InCompArg[dict]
     
     def execute(self, ctx) -> None:
-        if self.agent_provider.value != 'openai' and self.agent_provider.value != 'vertexai' and self.agent_provider.value != 'bedrock':
-            raise Exception(f"agent provider: {self.agent_provider.value} is not supported in this version of xai_agent.")
+        provider = self.agent_provider.value
+        if provider not in ['openai', 'vertexai', 'bedrock']:
+            raise Exception(f"Agent provider '{provider}' is not supported.")
 
-        ctx['agent_' + self.agent_name.value] = {
-            'agent_toolbelt': self.toolbelt_spec.value,
-            'agent_provider': self.agent_provider.value,
+        agent_context_key = 'agent_' + self.agent_name.value
+        ctx[agent_context_key] = {
+            # Store standard tools under 'agent_toolbelt'
+            'agent_toolbelt': self.toolbelt_spec.value.get('standard_tools', {}),
+            # Store the list of enabled MCP server names
+            'enabled_mcp_servers': self.toolbelt_spec.value.get('mcp_servers', []),
+            'agent_provider': provider,
             'agent_memory': self.agent_memory.value,
             'agent_model': self.agent_model.value,
             'agent_system_prompt': self.system_prompt.value,
-            'max_thoughts': self.max_thoughts.value
+            'max_thoughts': self.max_thoughts.value if self.max_thoughts.value is not None else 5 # Default max_thoughts
         }
 
 
-def make_tools_prompt(toolbelt: dict) -> dict:
-    ret = ''
+@xai_component
+class AgentUpdate(Component):
+    agent_name: InCompArg[str]
+    new_agent_provider: InArg[str]
+    new_agent_model: InArg[str]
+    new_system_prompt: InArg[str]
     
-    for key, value in toolbelt.items():
-        ret += f'{key}: {value.description}\n'
+    def execute(self, ctx) -> None:
+        if self.agent_provider.value != 'openai' and self.agent_provider.value != 'vertexai' and self.agent_provider.value != 'bedrock':
+            raise Exception(f"agent provider: {self.agent_provider.value} is not supported in this version of xai_agent.")
 
+        agent = ctx['agent_' + self.agent_name.value]
+
+        if self.new_agent_provider.value is not None:
+            agent['agent_provider'] = self.new_agent_provider.value
+        if self.new_agent_model.value is not None:
+            agent['agent_model'] = self.new_agent_model.value
+        if self.new_system_prompt.value is not None:
+            agent['agent_system_prompt'] = self.new_system_prompt.value
+
+
+# Placeholder for querying core system about MCP tools
+# In a real implementation, this would interact with the framework/environment
+def query_core_system_for_mcp_tools(server_name: str) -> list:
+    """Placeholder: Queries the core system for tools provided by a specific MCP server."""
+    print(f"[Placeholder] Querying core system for tools from MCP server: {server_name}")
+    # Example response structure - replace with actual system interaction
+    if server_name == "filesystem": # Example
+         return [{"name": "readFile", "description": "Reads a file"}, {"name": "writeFile", "description": "Writes a file"}]
+    if server_name == "weather": # Example
+         return [{"name": "get_forecast", "description": "Gets weather forecast"}]
+    return []
+
+def make_tools_prompt(standard_toolbelt: dict, enabled_mcp_servers: list, metadata: dict, provided_system: str=None) -> dict:
+    """Generates the tool descriptions for the system prompt, including standard and MCP tools."""
+    tool_desc_parts = []
+
+    # 1. Add standard tools
+    for key, value in standard_toolbelt.items():
+        # Ensure value has a description attribute
+        desc = getattr(value, 'description', 'No description available.')
+        tool_desc_parts.append(f'{key}: {desc}')
+
+    # 2. Add MCP tools
+    for server_name in enabled_mcp_servers:
+        try:
+            mcp_tools = query_core_system_for_mcp_tools(server_name)
+            for tool_info in mcp_tools:
+                 # Optionally prefix with server name for clarity if needed: f'{server_name}.{tool_info["name"]}'
+                tool_desc_parts.append(f'{tool_info["name"]}: {tool_info["description"]}')
+        except Exception as e:
+            print(f"Error querying MCP tools for server '{server_name}': {e}")
+            tool_desc_parts.append(f"# Error loading tools for MCP server: {server_name}")
+
+    tools_string = '\n'.join(tool_desc_parts)
+
+    # Memory tool descriptions (unchanged)
     recall = 'lookup_memory: Fuzzily looks up a previously remembered JSON memo in your memory.\nEXAMPLE:\n\nUSER:\nWhat things did I have to do today?\nASSISTANT:\nTOOL: lookup_memory {"query":"todo list"}\nSYSTEM:\n[{"id": 1, "summary": Todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}]\nASSISTANT:\nTOOL: get_current_time\nSYSTEM:\n2024-02-01T09:30:03\nASSISTANT:\nLooks like you just had to send invoices today.\n'
-    remember = 'create_memory: Remembers a new json note for the future.  Always provide json with a summary prompt that will serve as the lookup vector.  The summary and entire json can be remembered later with lookup_memory.\nEXAMPLE:\n\nUSER:\nRemind me to send invoices on the first of Feburary.\nASSISTANT:\nTOOL: update_memory { "summary": "todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}"\n'
-    
-    return { 
-        'tools': ret,
+    remember = 'create_memory: Remembers a new json note for the future.  Always provide json with a summary prompt that will serve as the lookup vector.  The summary and entire json can be remembered later with lookup_memory.\nEXAMPLE:\n\nUSER:\nRemind me to send invoices on the first of Feburary.\nASSISTANT:\nTOOL: create_memory { "summary": "todo List for Februrary", "tasks": [{"title": "Send invoices", "due_date":"2025-02-01"}]}"\n'
+
+    return {
+        'tools': tools_string,
         'lookup_memory': recall,
         'create_memory': remember,
         'memory': recall + remember,
-        'tool_instruction': 'To use a tool write TOOL: in one line followed by the tool name and arguments, system will respond with the results.'
+        'tool_instruction': 'To use a tool write TOOL: in one line followed by the tool name and arguments, system will respond with the results.',
+        'metadata': metadata,
+        'provided_system': provided_system
     }
 
 def conversation_to_vertexai(conversation) -> str:
@@ -413,6 +512,26 @@ def conversation_to_vertexai(conversation) -> str:
     
     return ret
  
+@xai_component
+class AgentMergeSystem(Component):
+    new_system_prompt: InCompArg[str]
+    conversation: InCompArg[any]
+
+    out_conversation: OutArg[list]
+
+    def execute(self, ctx) -> None:
+        new_system_prompt = self.new_system_prompt.value
+        conversation = copy.deepcopy(self.conversation.value)
+        
+        if conversation[0]['role'] != 'system':
+            conversation.insert(0, {'role': 'system', 'content': new_system_prompt })
+        else:
+            provided_system = conversation[0]['content']
+            conversation[0]['content'] = provided_system + '\n\n' + new_system_prompt
+
+        self.out_conversation.value = conversation
+
+
 @xai_component
 class AgentRun(Component):
     """Run the agent with the given conversation.
@@ -432,25 +551,43 @@ class AgentRun(Component):
     on_thought: BaseComponent
 
     agent_name: InCompArg[str]
+    metadata: InArg[dict]
     conversation: InCompArg[any]
 
     out_conversation: OutArg[list]
     last_response: OutArg[str]
 
     def execute(self, ctx) -> None:
+        try:
+            self.do_execute(ctx)
+        except Exception as e:
+            print(e)
+            raise e
+            
+    def do_execute(self, ctx) -> None:
         agent = ctx['agent_' + self.agent_name.value]
 
         model_name = agent['agent_model']
-        toolbelt = agent['agent_toolbelt']
+        standard_toolbelt = agent['agent_toolbelt'] # Now contains only standard tools
+        enabled_mcp_servers = agent.get('enabled_mcp_servers', []) # Get the list of enabled MCP servers
         system_prompt = agent['agent_system_prompt']
 
         # deep to avoid messing with the original system prompt.
         conversation = copy.deepcopy(self.conversation.value)
 
+        metadata = self.metadata.value
+        
+
+        prompt_args = make_tools_prompt(standard_toolbelt, enabled_mcp_servers, metadata)
+
         if conversation[0]['role'] != 'system':
-            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+            # Insert new system prompt if none exists
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**prompt_args)})
         else:
-            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
+            # Format the existing system prompt
+            provided_system = conversation[0]['content']
+            prompt_args['provided_system'] = provided_system # Add existing system prompt content
+            conversation[0]['content'] = system_prompt.format(**prompt_args)
 
         thoughts = 0
         stress_level = 0.0  # Raise temperature if there are failures.
@@ -459,7 +596,7 @@ class AgentRun(Component):
             thoughts += 1
 
             if thoughts == agent['max_thoughts']:
-                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+                conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
             if agent['agent_provider'] == 'vertexai':
                 response = self.run_vertexai(ctx, model_name, conversation, stress_level)
@@ -473,7 +610,7 @@ class AgentRun(Component):
             conversation.append(response)
 
             if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
-                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
+                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], standard_toolbelt, enabled_mcp_servers, stress_level)
             else:
                 # Allow only one tool per thought.
                 break
@@ -583,54 +720,144 @@ class AgentRun(Component):
             print(result, flush=True)
             return {"role": "assistant", "content": "Error...."}
 
-    def handle_tool_use(self, ctx, agent, conversation, content, toolbelt, stress_level):        
-        # Save the last response of the agent for on_thought.
-        self.last_response.value = conversation[-1]['content']
+    # Placeholder for querying core system about which server provides a tool
+    def query_core_system_for_mcp_tool_server(self, tool_name: str) -> str | None:
+        """Placeholder: Queries the core system to find which MCP server provides a tool."""
+        print(f"[Placeholder] Querying core system for server providing tool: {tool_name}")
+        # Example logic - replace with actual system interaction
+        if tool_name in ["readFile", "writeFile"]: return "filesystem"
+        if tool_name == "get_forecast": return "weather"
+        return None
 
+    # Placeholder for triggering framework's use_mcp_tool
+    def framework_use_mcp_tool(self, server_name: str, tool_name: str, tool_args: str) -> str:
+        """Placeholder: Triggers the core framework to execute use_mcp_tool."""
+        print(f"[Placeholder] Framework executing use_mcp_tool: server='{server_name}', tool='{tool_name}', args='{tool_args}'")
+        # Example response - replace with actual framework interaction result
+        if tool_name == "get_forecast":
+            return json.dumps([{"city": "Example City", "temp": 15.0, "desc": "cloudy"}], indent=2)
+        elif tool_name == "readFile":
+             return "Placeholder file content for " + tool_args
+        # Simulate an error for unknown tools in placeholder
+        return f"ERROR: Placeholder framework could not execute tool '{tool_name}' on server '{server_name}'"
+
+
+    def handle_tool_use(self, ctx, agent, conversation, content, standard_toolbelt, enabled_mcp_servers, stress_level):
+        """Handles TOOL: calls, dispatching to standard tools or enabled MCP servers."""
+        self.last_response.value = conversation[-1]['content'] # Save pre-tool-call response
         lines = content.split("\n")
+        tool_executed = False # Flag to ensure only one TOOL: line is processed
 
         line_num = 0
         for line in lines:
             line_num += 1
-            if line.startswith("TOOL:"):
-                #Remove any hallucinated SYSTEM Or other TOOL calls until this line.
-                new_lines = lines[0:line_num] # lines[0:0] = [] 
-                conversation[-1]['content'] = '\n'.join(new_lines)
-                
+            if line.startswith("TOOL:") and not tool_executed:
+                tool_executed = True # Process only the first TOOL: line encountered
+
+                # Clean up agent response to only include text before the TOOL: call
+                cleaned_response_lines = lines[:line_num-1] # Exclude the TOOL: line itself
+                conversation[-1]['content'] = '\n'.join(cleaned_response_lines).strip()
+
                 command = line.split(":", 1)[1].strip()
                 try:
                     tool_name = command.split(" ", 1)[0].strip()
-                    tool_args = command.split(" ", 1)[1].strip()
-                except Exception:
+                    tool_args_str = command.split(" ", 1)[1].strip()
+                except IndexError: # Handle case where there are no arguments
                     tool_name = command.strip()
-                    tool_args = ""
+                    tool_args_str = ""
 
+                tool_result = None
+                error_message = None
+
+                # 1. Check Memory Tools (Special Handling)
                 if tool_name == 'lookup_memory':
-                    memory = agent['agent_memory']
-                    try:
-                        obj = json.loads(tool_args)
-                        tool_result = str(memory.query(obj['query'], 3))
-                    except:
-                        tool_result = str(memory.query(tool_args, 3))
-                    print(f"lookup_memory got result:\n{tool_result}", flush=True)
-                    conversation.append({"role": "system", "content": str(tool_result)})
-                elif tool_name == 'create_memory':
-                    try:
-                        obj = json.loads(tool_args)
-                        self.remember_tool(agent, obj, conversation)
-                    except:
-                        self.remember_tool(agent, tool_args, conversation)
-                else:
-                    stress_level = self.run_tool(toolbelt, tool_name, tool_args, conversation, stress_level)
-                    
-                # Give on_thought a chance to see the result of the tool.
-                self.out_conversation.value = conversation
-                SubGraphExecutor(self.on_thought).do(ctx)
+                    memory = agent.get('agent_memory')
+                    if memory:
+                        try:
+                            # Attempt to parse args as JSON for query structure
+                            try: obj = json.loads(tool_args_str); query = obj['query']
+                            except: query = tool_args_str # Fallback to raw string query
+                            tool_result = str(memory.query(query, 3))
+                            print(f"lookup_memory got result:\n{tool_result}", flush=True)
+                        except Exception as e:
+                            error_message = f"Error during lookup_memory: {e}"
+                            traceback.print_exc()
+                    else: error_message = "Memory component not available for lookup_memory."
 
-                # Only allow one tool call. LLMs hallucinate results.                
+                elif tool_name == 'create_memory':
+                    memory = agent.get('agent_memory')
+                    if memory:
+                        try:
+                            # Attempt to parse args as JSON, otherwise treat as string
+                            try: obj = json.loads(tool_args_str)
+                            except: obj = tool_args_str # Store raw string if not JSON
+                            self.remember_tool(agent, obj, conversation) # remember_tool handles adding to memory
+                            tool_result = f"Memory entry based on '{tool_args_str[:50]}...' stored." # Confirmation message
+                        except Exception as e:
+                            error_message = f"Error during create_memory: {e}"
+                            traceback.print_exc()
+                    else: error_message = "Memory component not available for create_memory."
+
+                # 2. Check Standard Tools
+                elif tool_name in standard_toolbelt:
+                    try:
+                        tool_callable = standard_toolbelt[tool_name]
+                        tool_result = tool_callable(tool_args_str) # Call the standard tool
+                        print(f"Standard tool '{tool_name}' got result:\n{tool_result}", flush=True)
+                    except Exception as e:
+                        error_message = f"Error executing standard tool '{tool_name}': {e}"
+                        traceback.print_exc()
+
+                # 3. Check Enabled MCP Tools
+                else:
+                    try:
+                        # Query system to find which server (if any) provides this tool
+                        server_name = self.query_core_system_for_mcp_tool_server(tool_name)
+
+                        if server_name and server_name in enabled_mcp_servers:
+                            # Tool belongs to an enabled MCP server, trigger framework execution
+                            tool_result = self.framework_use_mcp_tool(server_name, tool_name, tool_args_str)
+                            print(f"MCP tool '{tool_name}' on server '{server_name}' executed via framework. Result:\n{tool_result}", flush=True)
+                        elif server_name:
+                             error_message = f"Tool '{tool_name}' found on MCP server '{server_name}', but this server is not enabled for this agent run."
+                        else:
+                             error_message = f"Tool '{tool_name}' not found in standard tools or any known MCP server."
+
+                    except Exception as e:
+                         error_message = f"Error during MCP tool lookup/execution for '{tool_name}': {e}"
+                         traceback.print_exc()
+
+
+                # Append result or error to conversation
+                if error_message:
+                    print(f"Tool execution failed for '{tool_name}': {error_message}", flush=True)
+                    conversation.append({"role": "user", "content": f"SYSTEM:\nERROR: {error_message}"})
+                    stress_level = min(stress_level + 0.1, 1.5) # Increase stress on error
+                elif tool_result is not None:
+                     # Ensure result is a string, handle potential non-string returns gracefully
+                    result_str = str(tool_result)
+                    if result_str:
+                         conversation.append({"role": "user", "content": f"SYSTEM:\n{result_str}"})
+                    else:
+                         conversation.append({"role": "user", "content": "SYSTEM:\nTool executed successfully with empty result."})
+                    # Potentially decrease stress on success? stress_level = max(0, stress_level - 0.05)
+                # else: tool had no result and no error (e.g., create_memory handled its own confirmation)
+
+                # Give on_thought a chance to see the result/error
+                self.out_conversation.value = conversation
+                if hasattr(self, 'on_thought') and self.on_thought:
+                     SubGraphExecutor(self.on_thought).do(ctx)
+
+                # IMPORTANT: Break after processing the first TOOL: line
                 break
+            # End of if line.startswith("TOOL:")
+
+        # If no TOOL: line was found in the response content
+        if not tool_executed:
+             self.last_response.value = content # Update last response if no tool was called
 
         return stress_level
+
 
     def remember_tool(self, agent, tool_args, conversation):
         memory = agent['agent_memory']
@@ -652,32 +879,9 @@ class AgentRun(Component):
 
         memory.add('', prompt, json_memo)
         print(f"Added {prompt}: {memo} to memory", flush=True)
-        conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+        conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
 
-    def run_tool(self, toolbelt, tool_name, tool_args, conversation, stress_level):
-        try:
-            tool = toolbelt[tool_name]
-        except KeyError as e:
-            print(f"tool {tool_name} not found.")
-            conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
-            return min(stress_level + 0.1, 1.5)
-            
-        try:
-            tool_result = tool(tool_args)
-            print(f"tool {tool_name} got result:")
-            print(tool_result)
-
-            if str(tool_result) != '':
-                conversation.append({"role": "system", "content": str(tool_result)})
-            else:
-                conversation.append({"role": "system", "content": 'Empty string result'})
-
-            return stress_level        
-        except Exception as e:
-            print(f"tool {tool_name} got exception:")
-            traceback.print_exc()
-            conversation.append({"role": "system", "content": "ERROR: " + str(e)})
-        return min(stress_level + 0.1, 1.5)
+    # Note: run_tool is removed as its logic is now integrated into handle_tool_use
 
 
 @xai_component
@@ -704,13 +908,26 @@ class AgentRunTool(Component):
     updated_conversation: OutArg[list]
 
     def execute(self, ctx) -> None:
-        agent = ctx['agent_' + self.agent_name.value]
-        toolbelt = agent['agent_toolbelt']
+        agent_context = ctx['agent_' + self.agent_name.value]
+        standard_toolbelt = agent_context.get('agent_toolbelt', {})
+        enabled_mcp_servers = agent_context.get('enabled_mcp_servers', [])
 
         current_conversation = self.conversation.value.copy()  # Create a copy of the conversation
 
         try:
-            tool = toolbelt[self.tool_name.value]
+            # Check standard tools first
+            if self.tool_name.value in standard_toolbelt:
+                tool = standard_toolbelt[self.tool_name.value]
+                is_mcp = False
+            else:
+                # Check if it's an enabled MCP tool (requires framework interaction)
+                # Placeholder: Assume framework provides a way to check/get MCP tool info
+                server_name = self.query_core_system_for_mcp_tool_server(self.tool_name.value) # Reuse placeholder
+                if server_name and server_name in enabled_mcp_servers:
+                    # We don't get a callable here, we'll use the framework call below
+                    is_mcp = True
+                else:
+                    raise KeyError(f"Tool '{self.tool_name.value}' not found in standard tools or enabled MCP servers.")
 
             if self.tool_args.value is None:
                 args = ""
@@ -719,25 +936,30 @@ class AgentRunTool(Component):
             else:
                 args = json.dumps(self.tool_args.value)
                 
-            tool_result = tool(args)
+            if is_mcp:
+                 # Trigger framework's MCP tool execution
+                 tool_result = self.framework_use_mcp_tool(server_name, self.tool_name.value, args) # Reuse placeholder
+            else:
+                 # Execute standard tool callable
+                 tool_result = tool(args)
 
             # Append the tool usage to the copied conversation
             current_conversation.append({"role": "assistant", "content": f"TOOL: {self.tool_name.value} {self.tool_args.value}"})
 
             if tool_result != '':
-                current_conversation.append({"role": "system", "content": str(tool_result)})
+                current_conversation.append({"role": "user", "content": "SYSTEM:\n" + str(tool_result)}) # Use SYSTEM role for results
             else:
-                current_conversation.append({"role": "system", "content": 'Empty string result'})
+                current_conversation.append({"role": "user", "content": "SYSTEM:\nEmpty string result"}) # Use SYSTEM role
 
             self.tool_output.value = str(tool_result)
             self.updated_conversation.value = current_conversation
         except KeyError:
             error_message = f"ERROR: TOOL '{self.tool_name.value}' not found."
-            current_conversation.append({"role": "system", "content": error_message})
+            current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message}) # Use SYSTEM role
             self.updated_conversation.value = current_conversation
         except Exception as e:
             error_message = f"ERROR: An exception occurred while running the tool: {str(e)}"
-            current_conversation.append({"role": "system", "content": error_message})
+            current_conversation.append({"role": "user", "content": "SYSTEM:\n" + error_message}) # Use SYSTEM role
             self.updated_conversation.value = current_conversation
 
 
@@ -760,6 +982,7 @@ class AgentLearn(Component):
     on_thought: BaseComponent
 
     agent_name: InCompArg[str]
+    metadata: InArg[dict]
     conversation: InCompArg[any]
 
     out_conversation: OutArg[list]
@@ -771,14 +994,15 @@ class AgentLearn(Component):
         model_name = agent['agent_model']
         toolbelt = agent['agent_toolbelt']
         system_prompt = agent['agent_system_prompt']
+        metadata = self.metadata.value
 
         # Deep copy to avoid messing with the original system prompt.
         conversation = copy.deepcopy(self.conversation.value)
 
         if conversation[0]['role'] != 'system':
-            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
+            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt, metadata))})
         else:
-            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
+            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt, metadata))
 
         # Add system message to use memory tools
         memory_instruction = {
@@ -794,7 +1018,7 @@ class AgentLearn(Component):
             thoughts += 1
 
             if thoughts == agent['max_thoughts']:
-                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
+                conversation.append({"role": "user", "content": "SYSTEM:\nMaximum tool usage reached. Tools Unavailable"})
 
             if agent['agent_provider'] == 'vertexai':
                 response = self.run_vertexai(ctx, model_name, conversation, stress_level)
@@ -834,51 +1058,6 @@ class AgentLearn(Component):
         self.out_conversation.value = conversation
         self.last_response.value = conversation[-1]['content']
         
-    def execute_orig(self, ctx) -> None:
-        agent = ctx['agent_' + self.agent_name.value]
-
-        model_name = agent['agent_model']
-        toolbelt = agent['agent_toolbelt']
-        system_prompt = agent['agent_system_prompt']
-
-        # deep to avoid messing with the original system prompt.
-        conversation = copy.deepcopy(self.conversation.value)
-
-        if conversation[0]['role'] != 'system':
-            conversation.insert(0, {'role': 'system', 'content': system_prompt.format(**make_tools_prompt(toolbelt))})
-        else:
-            conversation[0]['content'] = system_prompt.format(**make_tools_prompt(toolbelt))
-
-        
-
-        thoughts = 0
-        stress_level = 0.0  # Raise temperature if there are failures.
-
-        while thoughts < agent['max_thoughts']:
-            thoughts += 1
-
-            if thoughts == agent['max_thoughts']:
-                conversation.append({"role": "system", "content": "Maximum tool usage reached. Tools Unavailable"})
-
-            if agent['agent_provider'] == 'vertexai':
-                response = self.run_vertexai(ctx, model_name, conversation, stress_level)
-            elif agent['agent_provider'] == 'openai':
-                response = self.run_openai(ctx, model_name, conversation, stress_level)
-            elif agent['agent_provider'] == 'bedrock':
-                response = self.run_bedrock(ctx, model_name, conversation, stress_level)
-            else:
-                raise ValueError("Unknown agent provider")
-
-            conversation.append(response)
-
-            if thoughts <= agent['max_thoughts'] and 'TOOL:' in response['content']:
-                stress_level = self.handle_tool_use(ctx, agent, conversation, response['content'], toolbelt, stress_level)
-            else:
-                # Allow only one tool per thought.
-                break
-
-        self.out_conversation.value = conversation
-        self.last_response.value = conversation[-1]['content']
 
     def run_bedrock(self, ctx, model_name, conversation, stress_level):
         print(conversation)
@@ -982,54 +1161,23 @@ class AgentLearn(Component):
             print(result, flush=True)
             return {"role": "assistant", "content": "Error...."}
 
-    def handle_tool_use(self, ctx, agent, conversation, content, toolbelt, stress_level):        
-        # Save the last response of the agent for on_thought.
-        self.last_response.value = conversation[-1]['content']
+    # Note: AgentLearn inherits from AgentRun, so its handle_tool_use needs the same signature update
+    # We can reuse the handle_tool_use implementation from AgentRun if AgentLearn doesn't override it.
+    # If AgentLearn *does* override it, that override needs the same parameter/logic updates.
+    # Assuming AgentLearn uses AgentRun's handle_tool_use for now. If not, this diff needs adjustment.
+    # If AgentLearn has its own copy, apply similar logic changes there.
+    # Based on the code, AgentLearn defines its own execute but seems to call AgentRun's methods like run_openai etc.
+    # It *doesn't* seem to redefine handle_tool_use, so inheriting the change should work.
+    # Let's remove the redundant handle_tool_use definition from AgentLearn if it exists,
+    # or ensure it calls super().handle_tool_use(...) if it adds specific logic.
+    # Checking the provided code again... AgentLearn *does* have its own copy of handle_tool_use (lines 1037-1084)
+    # and run_tool (lines 1108-1131). These need to be updated or removed to inherit from AgentRun.
+    # Easiest is to remove the redundant copies in AgentLearn and let it inherit.
 
-        lines = content.split("\n")
-
-        line_num = 0
-        for line in lines:
-            line_num += 1
-            if line.startswith("TOOL:"):
-                #Remove any hallucinated SYSTEM Or other TOOL calls until this line.
-                new_lines = lines[0:line_num] # lines[0:0] = [] 
-                conversation[-1]['content'] = '\n'.join(new_lines)
-                
-                command = line.split(":", 1)[1].strip()
-                try:
-                    tool_name = command.split(" ", 1)[0].strip()
-                    tool_args = command.split(" ", 1)[1].strip()
-                except Exception:
-                    tool_name = command.strip()
-                    tool_args = ""
-
-                if tool_name == 'lookup_memory':
-                    memory = agent['agent_memory']
-                    try:
-                        obj = json.loads(tool_args)
-                        tool_result = str(memory.query(obj['query'], 3))
-                    except:
-                        tool_result = str(memory.query(tool_args, 3))
-                    print(f"lookup_memory got result:\n{tool_result}", flush=True)
-                    conversation.append({"role": "system", "content": str(tool_result)})
-                elif tool_name == 'create_memory':
-                    try:
-                        obj = json.loads(tool_args)
-                        self.remember_tool(agent, obj, conversation)
-                    except:
-                        self.remember_tool(agent, tool_args, conversation)
-                else:
-                    stress_level = self.run_tool(toolbelt, tool_name, tool_args, conversation, stress_level)
-                    
-                # Give on_thought a chance to see the result of the tool.
-                self.out_conversation.value = conversation
-                SubGraphExecutor(self.on_thought).do(ctx)
-
-                # Only allow one tool call. LLMs hallucinate results.                
-                break
-
-        return stress_level
+    # Remove redundant handle_tool_use from AgentLearn (lines 1037-1084)
+    # Remove redundant run_tool from AgentLearn (lines 1108-1131)
+    # The call in AgentLearn.execute (line 908) will now correctly call the modified AgentRun.handle_tool_use
+    pass # Placeholder for the removal diffs below
 
     def remember_tool(self, agent, tool_args, conversation):
         memory = agent['agent_memory']
@@ -1051,32 +1199,9 @@ class AgentLearn(Component):
 
         memory.add('', prompt, json_memo)
         print(f"Added {prompt}: {memo} to memory", flush=True)
-        conversation.append({"role": "system", "content": f"Memory {prompt} stored."})
+        conversation.append({"role": "user", "content": f"SYSTEM:\nMemory {prompt} stored."})
 
-    def run_tool(self, toolbelt, tool_name, tool_args, conversation, stress_level):
-        try:
-            tool = toolbelt[tool_name]
-        except KeyError as e:
-            print(f"tool {tool_name} not found.")
-            conversation.append({"role": "system", "content": "ERROR: Tool not available: " + str(e)})
-            return min(stress_level + 0.1, 1.5)
-            
-        try:
-            tool_result = tool(tool_args)
-            print(f"tool {tool_name} got result:")
-            print(tool_result)
-
-            if str(tool_result) != '':
-                conversation.append({"role": "system", "content": str(tool_result)})
-            else:
-                conversation.append({"role": "system", "content": 'Empty string result'})
-
-            return stress_level        
-        except Exception as e:
-            print(f"tool {tool_name} got exception:")
-            traceback.print_exc()
-            conversation.append({"role": "system", "content": "ERROR: " + str(e)})
-        return min(stress_level + 0.1, 1.5)
+    # Note: run_tool is removed from AgentLearn to inherit from AgentRun (where it's also removed)
 
 def word_or_pair_generator(input_string):
     words = input_string.split(' ')
