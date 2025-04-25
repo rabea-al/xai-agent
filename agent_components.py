@@ -954,7 +954,7 @@ class AgentRun(Component):
     # Note: run_bedrock, run_vertexai, run_openai methods are removed.
 
     # Placeholder for querying core system about which server provides a tool
-    def query_core_system_for_mcp_tool_server(self, tool_name: str) -> str | None:
+    def query_core_system_for_mcp_tool_server(self, tool_name: str):
         """Placeholder: Queries the core system to find which MCP server provides a tool."""
         print(f"[Placeholder] Querying core system for server providing tool: {tool_name}")
         # Example logic - replace with actual system interaction
