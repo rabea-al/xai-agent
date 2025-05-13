@@ -812,22 +812,31 @@ def _run_llm_openai(ctx, model_name, conversation, temperature):
     if conversation and conversation[-1]['role'] == 'assistant' and not conversation[-1]['content']:
         conversation = conversation[:-1]
 
-    # Basic parameters
-    params = {
-        "model": model_name,
-        "messages": conversation,
-        "max_tokens": 8192, # Consider making configurable
-        "stop": ["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"], # Standard stops
-        "temperature": temperature
-    }
-
-    # Add model-specific parameters if needed (e.g., reasoning_effort)
-    # Example:
-    # if model_name.startswith('o1') or model_name.startswith('o3'):
-    #     params['reasoning_effort'] = 'low' # Or determine based on temp/stress
-
     try:
-        completion = openai.chat.completions.create(**params)
+        if model_name.startswith('o1') or model_name.startswith('o3') or model_name.startswith('o4'):
+            reasoning_effort = 'low'
+            if temperature > 0.3:
+                reasoning_effort = 'medium'
+            elif temperature > 0.5:
+                reasoning_effort = 'high'
+                
+            completion = openai.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                max_completion_tokens=8192,
+                reasoning_effort=reasoning_effort
+            )
+        else:
+            params = {
+                "model": model_name,
+                "messages": conversation,
+                "max_tokens": 8192,
+                "stop": ["\nsystem:\n", "\nSYSTEM:\n", "\nUSER:\n", "\nASSISTANT:\n"],
+                "temperature": temperature,
+                "response_format": { "type": "text" }
+            }
+            completion = openai.chat.completions.create(**params)
+
         # Ensure message content is accessed correctly
         response_content = ""
         if completion.choices and completion.choices[0].message:
