@@ -1,4 +1,4 @@
-requests
-vecto-sdk
-numpy
-openai==1.57.*
+numpy==1.26.4
+openai==1.79.0
+vecto-sdk==0.2.3
+requests==2.31.0
